@@ -1366,13 +1366,34 @@ int saveProfile(const std::string& nombre)
     for (const std::string& tid : titlesWithIcons())
     {
         std::filesystem::create_directories(dest + tid, ec);
+
+        // Antes se contaba el titulo pasara lo que pasara y los errores de copia
+        // se tragaban, asi que un perfil podia quedarse con carpetas vacias y aun
+        // asi decir que habia guardado N juegos. Luego, al abrirlo, no habia
+        // iconos que mostrar y no habia forma de saber por que.
+        int archivosCopiados = 0;
         for (const std::string& archivo : { std::string("icon.jpg"), std::string("icon174.jpg") })
         {
             std::string origen = "sdmc:/atmosphere/contents/" + tid + "/" + archivo;
-            if (std::filesystem::exists(origen, ec))
-                std::filesystem::copy_file(origen, dest + tid + "/" + archivo, std::filesystem::copy_options::overwrite_existing, ec);
+            std::error_code ecCopia;
+            if (!std::filesystem::exists(origen, ecCopia))
+                continue;
+
+            std::filesystem::copy_file(origen, dest + tid + "/" + archivo, std::filesystem::copy_options::overwrite_existing, ecCopia);
+            if (ecCopia)
+                continue;
+
+            // Que copy_file no se queje no basta: se comprueba que el destino
+            // exista y no este vacio.
+            auto tam = std::filesystem::file_size(dest + tid + "/" + archivo, ecCopia);
+            if (!ecCopia && tam > 0)
+                archivosCopiados++;
         }
-        copiados++;
+
+        if (archivosCopiados > 0)
+            copiados++;
+        else
+            std::filesystem::remove_all(dest + tid, ec);  // sin iconos, no dejar la carpeta
     }
     return copiados;
 }
