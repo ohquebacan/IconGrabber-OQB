@@ -351,6 +351,14 @@ bool overwriteIcon(const std::string& tid, const std::string& imagePath)
     std::remove(iconPathFor(tid).c_str());
     std::remove(smallIconPathFor(tid).c_str());
 
+    // Y se invalida la cache ya, con los archivos fuera. Sin este paso el menu
+    // pasa de un icono propio a otro sin ver nunca el estado intermedio, y se
+    // queda mostrando el anterior: habia que borrar el icono, volver al
+    // original, reiniciar, y recien entonces elegir otro. Invalidando aqui el
+    // sistema refresca primero al original y despues al nuevo, que es lo mismo
+    // que hacia ese rodeo manual pero sin reiniciar.
+    invalidateControlCache(tid);
+
     // Los dos archivos se muestran distinto, así que se preparan distinto:
     //  - el grande lo estira el tema vertical, así que va aplastado a propósito;
     //  - el chico lo dibuja el sistema en marco cuadrado (la lista completa y la
@@ -1048,6 +1056,22 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
         });
         list->addView(restore);
     }
+
+    // Salida manual por si el menu se queda mostrando un icono viejo. Normalmente
+    // no hace falta, porque aplicar ya invalida la cache; esta aqui para no tener
+    // que recurrir al rodeo de quitar el icono, reiniciar y volver a ponerlo.
+    brls::ListItem* refresh = new brls::ListItem("Refrescar la caché del menú", "", "Si el menú sigue mostrando el icono anterior");
+    refresh->getClickEvent()->subscribe([tid, gameName, refresh](brls::View* view) {
+        if (!controlDataAvailable(strtoull(tid.c_str(), NULL, 16)))
+        {
+            brls::Application::notify("Este juego no está instalado.\nRefrescar su caché le borraría el nombre\ny el icono, así que no se toca.");
+            return;
+        }
+        invalidateControlCache(tid);
+        refresh->setValue("hecho");
+        brls::Application::notify("Caché refrescada para " + gameName);
+    });
+    list->addView(refresh);
 
     brls::ListItem* localItem = new brls::ListItem("Usar una imagen de la SD", "", "Para cuando SteamGridDB no tiene nada");
     localItem->getClickEvent()->subscribe([tid, gameName](brls::View* view) {
