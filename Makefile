@@ -43,9 +43,9 @@ SOURCES		:=	example
 DATA		:=	data
 ICON		:=	resources/icon/borealis.jpg
 INCLUDES	:=	example
-APP_TITLE	:=	IconGrabber
-APP_AUTHOR	:=	Slluxx
-APP_VERSION	:=	1.0.0
+APP_TITLE	:=	IconGrabber OQB
+APP_AUTHOR	:=	OH! QUÉ BACÁN
+APP_VERSION	:=	2.0.0
 
 ROMFS				:=	resources
 BOREALIS_PATH		:=	.
