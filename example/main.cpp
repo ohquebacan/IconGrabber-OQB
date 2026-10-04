@@ -300,7 +300,11 @@ bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE
         // El grande entra en 0x20000 (131.072). El chico tiene su propio tope, más
         // bajo: medido en consola, los que pasaban de ~65 KB no se aplicaban, y
         // encima arrastraban al grande, que se quedaba sin cambiar tampoco.
-        const size_t LIMITE = (SIDE >= 256) ? 120000 : 60000;
+        // 102400 y 65536 son los limites que documenta sys-ticon para FW 19.0.0+
+        // y 20.0.0+. sys-icon aguanta mas en el grande, pero capando al menor de
+        // los dos el icono vale para cualquiera de los dos sysmodules, y el
+        // usuario no tiene que saber cual tiene instalado.
+        const size_t LIMITE = (SIDE >= 256) ? 102400 : 60000;
         const int calidades[] = { 100, 92, 85, 75, 65, 55, 45 };
         ok = false;
 

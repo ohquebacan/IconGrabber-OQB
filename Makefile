@@ -45,7 +45,7 @@ ICON		:=	resources/icon/borealis.jpg
 INCLUDES	:=	example
 APP_TITLE	:=	IconGrabber OQB
 APP_AUTHOR	:=	OH! QUÉ BACÁN
-APP_VERSION	:=	2.0.0
+APP_VERSION	:=	2.0.1
 
 ROMFS				:=	resources
 BOREALIS_PATH		:=	.
