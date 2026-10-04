@@ -1380,6 +1380,46 @@ std::vector<std::string> titlesWithIcons()
     return out;
 }
 
+// std::filesystem::copy_file no copia nada en esta consola con rutas sdmc:, y
+// como devuelve el fallo por error_code en vez de lanzar, los perfiles se
+// guardaban vacios sin que nada se quejara. Se copia a mano, que es lo que usa
+// el resto de la app y funciona.
+bool copyFileRaw(const std::string& origen, const std::string& destino)
+{
+    FILE* in = fopen(origen.c_str(), "rb");
+    if (in == NULL)
+        return false;
+
+    FILE* out = fopen(destino.c_str(), "wb");
+    if (out == NULL)
+    {
+        fclose(in);
+        return false;
+    }
+
+    char buffer[32 * 1024];
+    size_t leidos;
+    bool ok = true;
+    while ((leidos = fread(buffer, 1, sizeof(buffer), in)) > 0)
+    {
+        if (fwrite(buffer, 1, leidos, out) != leidos)
+        {
+            ok = false;
+            break;
+        }
+    }
+    if (ferror(in))
+        ok = false;
+
+    fclose(in);
+    fclose(out);
+
+    if (!ok)
+        std::remove(destino.c_str());
+
+    return ok;
+}
+
 int saveProfile(const std::string& nombre)
 {
     std::error_code ec;
@@ -1403,12 +1443,11 @@ int saveProfile(const std::string& nombre)
             if (!std::filesystem::exists(origen, ecCopia))
                 continue;
 
-            std::filesystem::copy_file(origen, dest + tid + "/" + archivo, std::filesystem::copy_options::overwrite_existing, ecCopia);
-            if (ecCopia)
+            if (!copyFileRaw(origen, dest + tid + "/" + archivo))
                 continue;
 
-            // Que copy_file no se queje no basta: se comprueba que el destino
-            // exista y no este vacio.
+            // Que la copia diga que fue bien no basta: se comprueba que el
+            // destino exista y no este vacio.
             auto tam = std::filesystem::file_size(dest + tid + "/" + archivo, ecCopia);
             if (!ecCopia && tam > 0)
                 archivosCopiados++;
@@ -1443,7 +1482,7 @@ int applyProfile(const std::string& nombre)
             std::string f = entry.path().string() + "/" + archivo;
             if (std::filesystem::exists(f, ec))
             {
-                std::filesystem::copy_file(f, dest + archivo, std::filesystem::copy_options::overwrite_existing, ec);
+                copyFileRaw(f, dest + archivo);
                 alguno = true;
             }
         }
@@ -1531,9 +1570,9 @@ void frame_profile(const std::string& nombre)
             std::string dest = "sdmc:/atmosphere/contents/" + tid + "/";
             std::filesystem::create_directories(dest, ec2);
             if (std::filesystem::exists(big, ec2))
-                std::filesystem::copy_file(big, dest + "icon.jpg", std::filesystem::copy_options::overwrite_existing, ec2);
+                copyFileRaw(big, dest + "icon.jpg");
             if (std::filesystem::exists(small, ec2))
-                std::filesystem::copy_file(small, dest + "icon174.jpg", std::filesystem::copy_options::overwrite_existing, ec2);
+                copyFileRaw(small, dest + "icon174.jpg");
             invalidateControlCache(tid);
             brls::Application::notify("Aplicado a " + etiqueta + "\nSe ve al reiniciar");
         };
