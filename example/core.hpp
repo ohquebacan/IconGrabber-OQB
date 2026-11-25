@@ -78,6 +78,9 @@ EstadoIcono iconState(const std::string& tid);
 std::map<std::string, std::string> iconSources();
 
 bool namesSysmoduleInstalled();
+bool nexusInstalado();
+bool sysIconActivo();
+bool apagarSysIcon();
 std::string customName(const std::string& tid);
 bool setCustomName(const std::string& tid, const std::string& nombre, const std::string& autor);
 bool removeCustomName(const std::string& tid);

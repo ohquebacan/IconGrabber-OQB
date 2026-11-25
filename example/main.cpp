@@ -40,11 +40,10 @@ std::string configPath = "sdmc:/config/icongrabber/config.json";
 
 // El sysmodule que aplica los íconos. sys-icon es el que sigue mantenido;
 // sys-tweak es el viejo y se acepta por compatibilidad.
-const std::string USER_ICONS_DIR = "sdmc:/íconos/";
-const std::string PROFILES_DIR   = "sdmc:/íconos/perfiles/";
+const std::string USER_ICONS_DIR = "sdmc:/iconos/";
+const std::string PROFILES_DIR   = "sdmc:/iconos/perfiles/";
 
 const std::string SYSICON_PATH  = "sdmc:/atmosphere/contents/00FF69636F6EFF00/exefs.nsp";
-const std::string SYSTWEAK_PATH = "sdmc:/atmosphere/contents/00FF747765616BFF/exefs.nsp";
 
 std::vector<std::string> allowedStyles = {
     "all styles",
@@ -66,6 +65,7 @@ std::vector<std::string> allowedImageResolutions = {
 };
 
 #include "core.hpp"
+#include "dialogo_centrado.hpp"
 #include "vistas.hpp"
 
 // Las notificaciones de borealis no se pueden pedir desde otro hilo: el trabajo
@@ -197,13 +197,12 @@ bool hasCustomIcon(const std::string& tid)
 
 bool sysmoduleInstalled()
 {
-    return existe(SYSICON_PATH) || existe(SYSTWEAK_PATH);
+    return existe(SYSICON_PATH);
 }
 
 std::string sysmoduleName()
 {
     if (existe(SYSICON_PATH)) return "sys-icon";
-    if (existe(SYSTWEAK_PATH)) return "sys-tweak";
     return "";
 }
 
@@ -1014,7 +1013,7 @@ bool useOriginalIconAdapted(const std::string& tid, const std::string& gameName)
 // y no dejar que el usuario tenga que acordarse de ir a Ajustes.
 void askReboot(const std::string& mensaje)
 {
-    brls::Dialog* dialog = new brls::Dialog(mensaje + "\n\nLos íconos se ven después de reiniciar.\n¿Reiniciar ahora?");
+    brls::Dialog* dialog = new DialogoCentrado(mensaje + "\n\nLos íconos se ven después de reiniciar.\n¿Reiniciar ahora?");
     dialog->addButton("Reiniciar", [](brls::View* v) {
         if (R_SUCCEEDED(spsmInitialize()))
         {
@@ -1056,7 +1055,7 @@ bool isImageFile(const std::filesystem::path& p)
 
 // El ajuste del recorte está en vistas.cpp (VistaRecorte).
 
-// Íconos propios: cualquier imagen que el usuario deje en /íconos/ de la SD, más
+// Íconos propios: cualquier imagen que el usuario deje en /iconos/ de la SD, más
 // lo que ya se haya descargado antes. Sirve cuando SteamGridDB no tiene nada.
 void frame_localImages(const std::string& tid, const std::string& gameName)
 {
@@ -1117,7 +1116,7 @@ void frame_localImages(const std::string& tid, const std::string& gameName)
     }
 
     if (added == 0)
-        list->addView(new brls::ListItem("No hay imágenes todavía", "Copia archivos .jpg o .png a la carpeta /íconos/ de la SD"));
+        list->addView(new brls::ListItem("No hay imágenes todavía", "Copia archivos .jpg o .png a la carpeta /iconos/ de la SD"));
 
     frame->setContentView(list);
     brls::Application::pushView(frame);
@@ -1464,7 +1463,7 @@ bool setSidebarImage(brls::ThumbnailSidebar* sidebar, const std::string& path)
 
 // ------------------------------------------------------------- perfiles ---
 // Un perfil es una copia de todos los íconos puestos, guardada en
-// /íconos/perfiles/<nombre>/<tid>/. Sirve para tener un juego de íconos por
+// /iconos/perfiles/<nombre>/<tid>/. Sirve para tener un juego de íconos por
 // tema: verticales para uno, cuadrados para otro, y cambiar de golpe.
 
 std::vector<std::string> listProfiles()
@@ -1599,6 +1598,7 @@ std::string profileTheme(const std::string& nombre)
         f >> j;
         const int fit = j.value("fit_mode", 0), chico = j.value("small_mode", 1);
         if (fit == 3 && chico == 0) return "Tema con HOME vertical";
+        if (fit == 3 && chico == 2) return "Tema vertical en todo";
         if (fit == 0 && chico == 1) return "Tema normal (cuadrado)";
         return "Combinación propia";
     }
@@ -1696,7 +1696,7 @@ void frame_profile(const std::string& nombre)
     brls::ListItem* todos = new brls::ListItem("Aplicar todo el perfil");
     todos->getClickEvent()->subscribe([nombre](brls::View* view) {
         const std::string tema = profileTheme(nombre);
-        brls::Dialog* dialog = new brls::Dialog("¿Aplicar el perfil «" + nombre + "»?\n\n" + (tema.empty() ? "" : tema + ".\n") + "Se quitan tus íconos actuales y se ponen los del perfil, con su tema.");
+        brls::Dialog* dialog = new DialogoCentrado("¿Aplicar el perfil «" + nombre + "»?\n\n" + (tema.empty() ? "" : tema + ".\n") + "Se quitan tus íconos actuales y se ponen los del perfil, con su tema.");
         dialog->addButton("Aplicar", [dialog, nombre](brls::View* v) {
             dialog->close([nombre] {
                 enSegundoPlano("Aplicar perfil", nombre, [nombre](std::function<void(int, int)>) {
@@ -1805,7 +1805,7 @@ void fillProfilesTab(brls::List* list)
     guardar->getClickEvent()->subscribe([list](brls::View* view) {
         // Un nombre sugerido según el tema; se puede cambiar.
         const nlohmann::json c = loadConfig();
-        const std::string base = c.value("fit_mode", 0) == 3 ? "Vertical" : "Cuadrado";
+        const std::string base = c.value("fit_mode", 0) != 3 ? "Cuadrado" : (c.value("small_mode", 1) == 2 ? "Vertical todo" : "Vertical");
         int n = 1;
         std::error_code ec;
         while (std::filesystem::exists(PROFILES_DIR + base + " " + std::to_string(n), ec)) n++;
@@ -1822,7 +1822,7 @@ void fillProfilesTab(brls::List* list)
 
     brls::ListItem* quitar = new brls::ListItem("Dejar todos los íconos originales", "", "Quita los tuyos de todos los juegos (los perfiles no se tocan)");
     quitar->getClickEvent()->subscribe([list](brls::View* view) {
-        brls::Dialog* dialog = new brls::Dialog("Se van a quitar tus íconos de todos los juegos.\n\nLos perfiles guardados no se tocan, así que puedes volver cuando quieras.\n¿Seguimos?");
+        brls::Dialog* dialog = new DialogoCentrado("Se van a quitar tus íconos de todos los juegos.\n\nLos perfiles guardados no se tocan, así que puedes volver cuando quieras.\n¿Seguimos?");
         dialog->addButton("Quitar", [dialog](brls::View* v) {
             dialog->close([] {
                 enSegundoPlano("Íconos originales", "Se quitan los tuyos de todos los juegos.", [](std::function<void(int, int)>) {
@@ -1850,7 +1850,7 @@ void addProfileRows(brls::List* list)
 
     // Agrupados por tema: primero los cuadrados, después los de HOME vertical.
     std::stable_sort(perfiles.begin(), perfiles.end(), [](const std::string& a, const std::string& b) {
-        auto orden = [](const std::string& t) { return t == "Tema normal (cuadrado)" ? 0 : t == "Tema con HOME vertical" ? 1 : 2; };
+        auto orden = [](const std::string& t) { return t == "Tema normal (cuadrado)" ? 0 : t == "Tema con HOME vertical" ? 1 : t == "Tema vertical en todo" ? 2 : 3; };
         return orden(profileTheme(a)) < orden(profileTheme(b));
     });
     std::string grupo = "-";
@@ -1997,10 +1997,37 @@ EstadoIcono iconState(const std::string& tid)
 // sys-ticon lee atmosphere/contents/<tid>/config.ini, sección [override_nacp]
 // al principio del archivo: name y author van siempre juntos.
 
+/* Nexus Bacán (juegos desde el USB): con sys-icon a la vez, la consola se queda
+   en el logo al encender (probado en la Lite el 24-nov-2026). */
+bool nexusInstalado()
+{
+    /* Nexus registra el servicio «ams:usb» mientras corre. Los archivos que deja en
+       la SD (su registro, su kip) se quedan aunque se pase a un pack sin Nexus, y
+       daban falsos avisos. Se pregunta al sistema, sin conectarse. */
+    // Comando 65100 de sm (AtmosphereHasService); desde FW 12 sm habla TIPC.
+    const SmServiceName nombre = smEncodeName("ams:usb");
+    u8 hay                     = 0;
+    const Result rc            = hosversionAtLeast(12, 0, 0) ? tipcDispatchInOut(smGetServiceSessionTipc(), 65100, nombre, hay)
+                                                             : serviceDispatchInOut(smGetServiceSession(), 65100, nombre, hay);
+    return R_SUCCEEDED(rc) && hay != 0;
+}
+
+bool sysIconActivo()
+{
+    return existe("sdmc:/atmosphere/contents/00FF69636F6EFF00/flags/boot2.flag");
+}
+
+bool apagarSysIcon()
+{
+    return std::remove("sdmc:/atmosphere/contents/00FF69636F6EFF00/flags/boot2.flag") == 0;
+}
+
+// Los nombres los aplica sys-icon (config.ini de cada juego).
 bool namesSysmoduleInstalled()
 {
-    return existe(SYSTWEAK_PATH);
+    return existe(SYSICON_PATH);
 }
+
 
 static std::string nameConfigPath(const std::string& tid)
 {

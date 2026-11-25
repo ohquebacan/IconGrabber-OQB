@@ -11,6 +11,7 @@
 #include <filesystem>
 
 #include "core.hpp"
+#include "dialogo_centrado.hpp"
 #include "oqb_theme.hpp"
 #include "vistas.hpp"
 
@@ -81,6 +82,19 @@ int main(int argc, char* argv[])
     marca("ventana puesta");
 
     // Sin token, lo primero es ofrecer ponerlo desde el celular.
+    // sys-icon y Nexus Bacán juntos: al encender, la consola se queda en el logo.
+    if (sysIconActivo() && nexusInstalado())
+    {
+        brls::Dialog* d = new DialogoCentrado("Tienes sys-icon y Nexus Bacán a la vez. Con los dos, la consola se queda en el logo de Nintendo Switch al reiniciar.\n\nApaga sys-icon antes de reiniciar. Tus íconos quedan guardados para cuando lo vuelvas a usar.");
+        d->addButton("Apagar sys-icon", [d](brls::View*) {
+            const bool ok = apagarSysIcon();
+            d->close([ok] { avisar(ok ? "sys-icon apagado. Ya puedes reiniciar." : "No se pudo apagar: borra atmosphere/contents/00FF69636F6EFF00/flags/boot2.flag"); });
+        });
+        d->addButton("Dejarlo", [d](brls::View*) { d->close(); });
+        d->setCancelable(false);
+        d->open();
+    }
+
     try
     {
         marca("token?");

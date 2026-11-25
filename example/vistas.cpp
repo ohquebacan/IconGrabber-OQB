@@ -17,6 +17,7 @@ extern "C" {
 #include <thread>
 
 #include "core.hpp"
+#include "dialogo_centrado.hpp"
 #include "oqb_theme.hpp"
 #include "qrcodegen.h"
 
@@ -371,9 +372,9 @@ MarcoPrincipal::MarcoPrincipal()
     // Corto: a la derecha van los botones.
     std::string pie = "v" APP_VERSION;
     if (sysmoduleInstalled())
-        pie += " · " + std::string(sysmoduleName() == "sys-tweak" ? "sys-ticon" : sysmoduleName());
+        pie += " · " + sysmoduleName();
     else
-        pie += " · sin sys-icon";
+        pie += nexusInstalado() ? " · sin sys-icon (no va con Nexus)" : " · sin sys-icon";
     this->setFooterText(pie);
 }
 
@@ -1089,7 +1090,10 @@ void VistaIconos::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned he
                 this->original = imagenDeBytes(vg, datos);
             }
             loseta(this, vg, px + 10, py, 107, 160, grande, "", false, false, ctx);
-            loseta(this, vg, px + 170, py + 96, 64, 64, this->original, this->nombre, false, false, ctx);
+            if (this->previaChica > 0)  // tema vertical en todo: el chico también estirado a lo alto
+                loseta(this, vg, px + 180, py + 64, 43, 96, this->previaChica, "", false, false, ctx);
+            else
+                loseta(this, vg, px + 170, py + 96, 64, 64, this->original, this->nombre, false, false, ctx);
             texto(this, vg, px + 63, py + 170, "HOME", 13.0f, ctx->theme->descriptionColor, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
             texto(this, vg, px + 202, py + 170, "Todas las apps", 13.0f, ctx->theme->descriptionColor, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
         }
@@ -1434,19 +1438,32 @@ void VistaRecorte::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned h
    Detrás son los dos ajustes de siempre (fit_mode y small_mode). */
 VistaTema::VistaTema()
 {
-    this->registerAction("", brls::Key::DUP, [this] { this->elegido = 0; return true; }, true);
-    this->registerAction("", brls::Key::DDOWN, [this] { this->elegido = 1; return true; }, true);
+    this->registerAction("", brls::Key::DUP, [this] { this->elegido = std::max(0, this->elegido - 1); return true; }, true);
+    this->registerAction("", brls::Key::DDOWN, [this] { this->elegido = std::min(2, this->elegido + 1); return true; }, true);
     this->registerAction("Usar este", brls::Key::A, [this] {
         this->elegir(this->elegido);
         return true;
     });
-    this->elegido = this->actual();
+    this->elegido = std::max(0, this->actual());
 }
+
+namespace
+{
+// Cada tema son dos ajustes: cómo se prepara el grande (fit_mode) y el chico (small_mode).
+//   0 normal: recortar + chico recortado;
+//   1 HOME vertical: tema vertical + el chico del juego;
+//   2 vertical en todo: tema vertical + el chico también en 2:3.
+const int TEMA_FIT[3]   = { 0, 3, 3 };
+const int TEMA_CHICO[3] = { 1, 0, 2 };
+const char* TEMA_PERFIL[3] = { "Cuadrado", "Vertical", "Vertical todo" };
+}  // namespace
 
 int VistaTema::actual() const
 {
     const nlohmann::json c = loadConfig();
-    return c.value("fit_mode", 0) == 3 && c.value("small_mode", 1) == 0 ? 1 : (c.value("fit_mode", 0) == 0 && c.value("small_mode", 1) == 1 ? 0 : -1);
+    for (int i = 0; i < 3; ++i)
+        if (c.value("fit_mode", 0) == TEMA_FIT[i] && c.value("small_mode", 1) == TEMA_CHICO[i]) return i;
+    return -1;
 }
 
 /* Cambiar de tema deja los íconos limpios: los que tienes están hechos para
@@ -1457,8 +1474,8 @@ void VistaTema::elegir(int cual)
     if (cual == this->actual()) return;
     auto cambiarTema = [cual] {
         nlohmann::json c = loadConfig();
-        c["fit_mode"]    = cual == 1 ? 3 : 0;  // tema vertical / recortar
-        c["small_mode"]  = cual == 1 ? 0 : 1;  // el chico: el del juego / recortado
+        c["fit_mode"]    = TEMA_FIT[cual];
+        c["small_mode"]  = TEMA_CHICO[cual];
         saveConfig(c);
     };
     int propios = 0;
@@ -1468,19 +1485,22 @@ void VistaTema::elegir(int cual)
     if (propios == 0)
     {
         cambiarTema();
-        avisar(cual == 1 ? "Listo: busca íconos verticales; saldrán verticales en el HOME." : "Listo: busca íconos cuadrados; saldrán cuadrados en todas partes.");
+        avisar(cual == 0 ? "Listo: busca íconos cuadrados; saldrán cuadrados en todas partes."
+                         : cual == 1 ? "Listo: busca íconos verticales; saldrán verticales en el HOME."
+                                     : "Listo: busca íconos verticales; saldrán verticales en el HOME y en Todas las apps.");
         return;
     }
 
     // Nombre libre para el perfil del tema que se deja: «Cuadrado 1», «Vertical 2»...
-    const std::string base = cual == 1 ? "Cuadrado" : "Vertical";
+    const int dejado       = this->actual();
+    const std::string base = dejado >= 0 ? TEMA_PERFIL[dejado] : "Mis íconos";
     int n = 1;
     while (std::filesystem::exists("sdmc:/iconos/perfiles/" + base + " " + std::to_string(n), ec)) n++;
     const std::string perfil = base + " " + std::to_string(n);
 
     const std::string texto = std::to_string(propios) + (propios == 1 ? " ícono tuyo está hecho" : " íconos tuyos están hechos") +
                               " para el otro tema.\n\nAl cambiar se quitan, para que empieces de cero con " +
-                              (cual == 1 ? "íconos verticales." : "íconos cuadrados.") + "\n\n¿Los guardo antes en el perfil «" + perfil + "»?";
+                              (cual == 0 ? "íconos cuadrados." : "íconos verticales.") + "\n\n¿Los guardo antes en el perfil «" + perfil + "»?";
     auto trabajo = [cambiarTema, perfil](bool guardar) {
         return [cambiarTema, perfil, guardar](std::function<void(int, int)>) {
             auto iconos = [](int n) { return std::to_string(n) + (n == 1 ? " ícono" : " íconos"); };
@@ -1491,7 +1511,7 @@ void VistaTema::elegir(int cual)
             return r + "Quité " + iconos(quitados) + ". Ya puedes buscar íconos para el tema nuevo.";
         };
     };
-    brls::Dialog* d = new brls::Dialog(texto);
+    brls::Dialog* d = new DialogoCentrado(texto);
     d->addButton("Guardar y cambiar", [d, trabajo](brls::View*) {
         d->close([trabajo] { enSegundoPlano("Cambiar de tema", "Se guardan tus íconos en un perfil y se quitan.", trabajo(true), true); });
     });
@@ -1513,15 +1533,17 @@ void VistaTema::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned heig
     ly += 40.0f;
 
     const int enUso = this->actual();
-    const char* titulos[2] = { "Tema normal (cuadrado)", "Tema con HOME vertical" };
-    const char* detalles[2] = {
+    const char* titulos[3] = { "Tema normal (cuadrado)", "Tema con HOME vertical", "Tema vertical en todo" };
+    const char* detalles[3] = {
         "Lo normal. Tus íconos salen cuadrados, tal como los eliges, en el HOME y en Todas las apps.",
-        "Solo si tu tema muestra el HOME en vertical. Tus íconos se preparan en 2:3 para el HOME y Todas las apps se queda con los cuadrados originales, como los dibuja el sistema.",
+        "Tu tema muestra el HOME en vertical. Todas las apps se queda con los cuadrados originales.",
+        "Tu tema muestra en vertical el HOME y también Todas las apps. Los dos se preparan en 2:3.",
     };
-    const float ch = (y + height - 70.0f - ly - 18.0f) / 2;
-    for (int i = 0; i < 2; ++i)
+    const float gapC = 14.0f;
+    const float ch   = (y + height - 70.0f - ly - 2 * gapC) / 3;
+    for (int i = 0; i < 3; ++i)
     {
-        const float cy = ly + i * (ch + 18.0f);
+        const float cy = ly + i * (ch + gapC);
         nvgBeginPath(vg);
         nvgRoundedRect(vg, lx, cy, lw, ch, 18.0f);
         nvgFillColor(vg, this->a(oqb::velo(i == enUso ? 14 : 8)));
@@ -1535,28 +1557,29 @@ void VistaTema::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned heig
             nvgStroke(vg);
         }
         // Dibujo: tres del HOME y una fila de Todas las apps.
-        const float dx = lx + 26.0f, dy = cy + 26.0f;
-        const float hw = 54.0f, hh = i == 1 ? 81.0f : 54.0f;
+        const float dx = lx + 22.0f, dy = cy + 14.0f;
+        const float hw = 38.0f, hh = i >= 1 ? 57.0f : 38.0f;
         for (int k = 0; k < 3; ++k)
         {
             nvgBeginPath(vg);
-            nvgRoundedRect(vg, dx + k * (hw + 10), dy + (81.0f - hh), hw, hh, 8.0f);
+            nvgRoundedRect(vg, dx + k * (hw + 8), dy + (57.0f - hh), hw, hh, 7.0f);
             nvgFillColor(vg, this->a(oqb::esmeralda()));
             nvgFill(vg);
         }
-        texto(this, vg, dx + (3 * hw + 20) / 2, dy + 90.0f, "HOME", 13.0f, ctx->theme->descriptionColor, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
-        const float ax = dx + 3 * (hw + 10) + 30.0f;
+        texto(this, vg, dx + (3 * hw + 16) / 2, dy + 62.0f, "HOME", 12.0f, ctx->theme->descriptionColor, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
+        const float ax = dx + 3 * (hw + 8) + 28.0f;
+        const float aw = 24.0f, ah = i == 2 ? 36.0f : 24.0f;
         for (int k = 0; k < 4; ++k)
         {
             nvgBeginPath(vg);
-            nvgRoundedRect(vg, ax + k * 40.0f, dy + 45.0f, 34.0f, 34.0f, 6.0f);
+            nvgRoundedRect(vg, ax + k * 30.0f, dy + (57.0f - ah), aw, ah, 5.0f);
             nvgFillColor(vg, this->a(i == 1 ? oqb::velo(40) : oqb::esmeralda()));
             nvgFill(vg);
         }
-        texto(this, vg, ax + 77.0f, dy + 90.0f, i == 1 ? "Todas las apps: originales" : "Todas las apps: tuyos", 13.0f, ctx->theme->descriptionColor, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
+        texto(this, vg, ax + 57.0f, dy + 62.0f, i == 1 ? "Todas las apps: originales" : "Todas las apps: tuyos", 12.0f, ctx->theme->descriptionColor, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
 
-        const float tx = ax + 200.0f, tw = lx + lw - 24.0f - tx;
-        texto(this, vg, tx, cy + 28.0f, titulos[i], 22.0f, ctx->theme->textColor);
+        const float tx = ax + 170.0f, tw = lx + lw - 24.0f - tx;
+        texto(this, vg, tx, cy + 18.0f, titulos[i], 21.0f, ctx->theme->textColor);
         if (i == enUso)
         {
             nvgFontSize(vg, 22.0f);
@@ -1564,20 +1587,20 @@ void VistaTema::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned heig
             nvgFontSize(vg, 13.0f);
             const float pw = nvgTextBounds(vg, 0, 0, "En uso", nullptr, nullptr) + 18.0f;
             nvgBeginPath(vg);
-            nvgRoundedRect(vg, fin, cy + 30.0f, pw, 24.0f, 12.0f);
+            nvgRoundedRect(vg, fin, cy + 19.0f, pw, 24.0f, 12.0f);
             nvgFillColor(vg, this->a(nvgRGBA(52, 213, 131, 46)));
             nvgFill(vg);
-            texto(this, vg, fin + pw / 2, cy + 42.0f, "En uso", 13.0f, oqb::verdeTexto(), NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+            texto(this, vg, fin + pw / 2, cy + 31.0f, "En uso", 13.0f, oqb::verdeTexto(), NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
         }
         nvgFontSize(vg, 16.0f);
         nvgTextLineHeight(vg, 1.35f);
         nvgFillColor(vg, this->a(ctx->theme->descriptionColor));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
         nvgBeginPath(vg);
-        nvgTextBox(vg, tx, cy + 66.0f, tw, detalles[i], nullptr);
+        nvgTextBox(vg, tx, cy + 52.0f, tw, detalles[i], nullptr);
     }
     if (enUso < 0)
-        texto(this, vg, lx, y + height - 44.0f, "Ahora tienes una combinación propia (Ajustes › Avanzado). Elegir una de estas la reemplaza.", 15.0f, oqb::doradoTexto());
+        texto(this, vg, lx, y + height - 44.0f, "Ahora tienes una combinación propia. Elegir una de estas la reemplaza.", 15.0f, oqb::doradoTexto());
     else
         texto(this, vg, lx, y + height - 44.0f, "Al cambiar de tema se quitan tus íconos para empezar de cero (antes te ofrece guardarlos en un perfil).", 15.0f, ctx->theme->descriptionColor);
 }
@@ -2153,7 +2176,9 @@ brls::View* crearNombres()
 {
     brls::List* list = new brls::List();
     if (!namesSysmoduleInstalled())
-        list->addView(new brls::ListItem("Falta sys-ticon", "Para cambiar nombres hace falta sys-ticon. Lo instalas desde OQB Updater › Apps › Sysmodules. Los nombres que pongas aquí quedan guardados y se usan cuando lo tengas."));
+        list->addView(new brls::ListItem("Falta sys-icon", nexusInstalado()
+            ? "Para cambiar nombres hace falta sys-icon, pero no funciona junto con Nexus Bacán (la consola se queda en el logo). Los nombres que pongas aquí quedan guardados."
+            : "Para cambiar nombres hace falta sys-icon. Lo instalas desde OQB Updater › Apps › Sysmodules. Los nombres que pongas aquí quedan guardados y se usan cuando lo tengas."));
     list->addView(new brls::Header("A cambia el nombre · X vuelve al original · se ve al reiniciar"));
     for (auto& g : installedGames())
     {
@@ -2225,33 +2250,7 @@ brls::View* crearAjustes(VistaJuegos* juegos)
     });
     list->addView(estilo);
 
-    list->addView(new brls::Header("Avanzado (lo elige la pestaña Tema)"));
-    static const std::vector<std::string> fitNames = { "recortar", "ajustar", "estirar", "tema vertical 2:3" };
-    brls::ListItem* fit = new brls::ListItem("Imágenes no cuadradas", "", "Cómo encajarlas en el cuadro del HOME");
-    fit->setValue(fitNames[std::max(0, std::min(3, config.value("fit_mode", 0)))]);
-    fit->getClickEvent()->subscribe([fit](brls::View*) {
-        nlohmann::json c = loadConfig();
-        int m            = (c.value("fit_mode", 0) + 1) % 4;
-        c["fit_mode"]    = m;
-        saveConfig(c);
-        fit->setValue(fitNames[m]);
-        const char* d[4] = { "Toma el centro, sin deformar", "Entra completa, con franjas", "La aplasta al cuadro", "Vertical en el tema y recortado donde va cuadrado" };
-        avisar(d[m]);
-    });
-    list->addView(fit);
-
-    static const std::vector<std::string> smallNames = { "se deja el original", "recortado", "igual que el grande" };
-    brls::ListItem* chico = new brls::ListItem("Ícono chico", "", "El de la lista completa y la ventanita al cambiar de app");
-    chico->setValue(smallNames[std::max(0, std::min(2, config.value("small_mode", 1)))]);
-    chico->getClickEvent()->subscribe([chico](brls::View*) {
-        nlohmann::json c  = loadConfig();
-        int m             = (c.value("small_mode", 1) + 1) % 3;
-        c["small_mode"]   = m;
-        saveConfig(c);
-        chico->setValue(smallNames[m]);
-    });
-    list->addView(chico);
-
+    list->addView(new brls::Header("Juegos"));
     brls::ListItem* orden = new brls::ListItem("Orden de los juegos", "", "Alfabético o por lo último que jugaste");
     orden->setValue(config.value("sort_recent", false) ? "recientes" : "alfabético");
     orden->getClickEvent()->subscribe([orden, juegos](brls::View*) {
@@ -2289,7 +2288,7 @@ brls::View* crearAjustes(VistaJuegos* juegos)
 
     list->addView(new brls::Header("Consola"));
     brls::ListItem* sys = new brls::ListItem("Sysmodule", "");
-    sys->setValue(sysmoduleInstalled() ? (sysmoduleName() == "sys-tweak" ? "sys-ticon" : sysmoduleName()) : "falta");
+    sys->setValue(sysmoduleInstalled() ? sysmoduleName() : "falta");
     list->addView(sys);
 
     brls::ListItem* reiniciar = new brls::ListItem("Reiniciar la consola", "", "Para refrescar del todo el HOME");
