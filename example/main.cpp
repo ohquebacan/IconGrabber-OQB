@@ -2,9 +2,9 @@
     IconGrabber — versión OQB
     Fork de Slluxx/IconGrabber (GPLv3). El recorrido original estaba partido en
     tres pantallas: en una se elegía el tamaño, en otra se buscaba el juego, y
-    para aplicar el icono había que ir a una tercera y volver a buscar el juego.
-    Acá todo pasa en un solo camino: se elige el juego instalado, se ven sus
-    iconos y se aplica ahí mismo.
+    para aplicar el ícono había que ir a una tercera y volver a buscar el juego.
+    Aquí todo pasa en un solo camino: se elige el juego instalado, se ven sus
+    íconos y se aplica ahí mismo.
 */
 
 #include <curl/curl.h>
@@ -21,7 +21,11 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <iomanip>
+#include <set>
+#include <sstream>
 #include <string_view>
 
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
@@ -34,10 +38,10 @@ using namespace i18n::literals;
 
 std::string configPath = "sdmc:/config/icongrabber/config.json";
 
-// El sysmodule que aplica los iconos. sys-icon es el que sigue mantenido;
+// El sysmodule que aplica los íconos. sys-icon es el que sigue mantenido;
 // sys-tweak es el viejo y se acepta por compatibilidad.
-const std::string USER_ICONS_DIR = "sdmc:/iconos/";
-const std::string PROFILES_DIR   = "sdmc:/iconos/perfiles/";
+const std::string USER_ICONS_DIR = "sdmc:/íconos/";
+const std::string PROFILES_DIR   = "sdmc:/íconos/perfiles/";
 
 const std::string SYSICON_PATH  = "sdmc:/atmosphere/contents/00FF69636F6EFF00/exefs.nsp";
 const std::string SYSTWEAK_PATH = "sdmc:/atmosphere/contents/00FF747765616BFF/exefs.nsp";
@@ -61,52 +65,110 @@ std::vector<std::string> allowedImageResolutions = {
     "920x430"
 };
 
+#include "core.hpp"
+#include "vistas.hpp"
+
+// Las notificaciones de borealis no se pueden pedir desde otro hilo: el trabajo
+// en segundo plano (íconos para todos, aplicar un perfil) pone esto en true y
+// sus avisos van solo al registro.
+thread_local bool g_silencio = false;
+
+void avisar(const std::string& texto)
+{
+    if (g_silencio)
+        brls::Logger::info(texto);
+    else
+        brls::Application::notify(texto);
+}
+
+void marca(const std::string& texto)
+{
+    static std::mutex m;
+    std::lock_guard<std::mutex> l(m);
+    std::error_code ec;
+    std::filesystem::create_directories("sdmc:/config/icongrabber/", ec);
+    if (FILE* f = fopen("sdmc:/config/icongrabber/registro.log", "a"))
+    {
+        fprintf(f, "%llu %s\n", (unsigned long long)armGetSystemTick() / 19200, texto.c_str());
+        fclose(f);
+    }
+}
+
 // ---------------------------------------------------------------- config ---
+
+/* La configuración se lee desde varios hilos (el servidor del QR la escribe
+   mientras la pantalla la lee): un candado, sin excepciones de filesystem y
+   escritura a un temporal que después reemplaza al archivo. Leerla a medio
+   escribir cerraba la app (24-nov-2026). */
+static std::mutex g_mConfig;
+
+static nlohmann::json configPorDefecto()
+{
+    nlohmann::json config;
+    config["api_token"]     = "";
+    config["style_id"]      = 0;
+    config["resolution_id"] = 0;
+    return config;
+}
+
+static void escribirConfig(const nlohmann::json& config)
+{
+    std::error_code ec;
+    std::filesystem::create_directories("sdmc:/config/icongrabber/", ec);
+    const std::string temp = configPath + ".tmp";
+    {
+        std::ofstream o(temp, std::ios::trunc);
+        if (!o) return;
+        o << config.dump(4);
+        if (!o.good()) return;
+    }
+    std::remove(configPath.c_str());
+    std::rename(temp.c_str(), configPath.c_str());
+}
 
 nlohmann::json loadConfig()
 {
-    nlohmann::json config;
-    if (!std::filesystem::exists(configPath))
+    std::lock_guard<std::mutex> l(g_mConfig);
+    std::error_code ec;
+    if (!std::filesystem::exists(configPath, ec))
     {
-        std::filesystem::create_directories("sdmc:/config/icongrabber/");
-        config["api_token"]     = "";
-        config["style_id"]      = 0;
-        config["resolution_id"] = 0;
-        std::ofstream o(configPath);
-        o << config.dump(4);
-        o.close();
+        nlohmann::json config = configPorDefecto();
+        escribirConfig(config);
         return config;
     }
 
+    nlohmann::json config;
     try
     {
         std::ifstream i(configPath);
         i >> config;
-        i.close();
     }
     catch (const std::exception& e)
     {
         brls::Logger::error("config ilegible, se usa uno nuevo");
-        config["api_token"]     = "";
-        config["style_id"]      = 0;
-        config["resolution_id"] = 0;
+        config = configPorDefecto();
     }
-
-    if (!config.contains("api_token")) config["api_token"] = "";
-    if (!config.contains("style_id")) config["style_id"] = 0;
-    if (!config.contains("resolution_id")) config["resolution_id"] = 0;
+    if (!config.is_object()) config = configPorDefecto();
+    if (!config.contains("api_token") || !config["api_token"].is_string()) config["api_token"] = "";
+    if (!config.contains("style_id") || !config["style_id"].is_number()) config["style_id"] = 0;
+    if (!config.contains("resolution_id") || !config["resolution_id"].is_number()) config["resolution_id"] = 0;
     return config;
 }
 
 void saveConfig(nlohmann::json config)
 {
-    std::filesystem::create_directories("sdmc:/config/icongrabber/");
-    std::ofstream o(configPath);
-    o << config.dump(4);
-    o.close();
+    std::lock_guard<std::mutex> l(g_mConfig);
+    escribirConfig(config);
 }
 
 // ----------------------------------------------------------------- util ----
+
+// exists() sin excepciones: con la SD ocupada lanza «I/O error» y cerraba la app.
+static bool existe(const std::string& ruta)
+{
+    std::error_code ec;
+    return std::filesystem::exists(ruta, ec);
+}
 
 std::string formatApplicationId(u64 ApplicationId)
 {
@@ -117,7 +179,7 @@ std::string formatApplicationId(u64 ApplicationId)
 
 // sys-icon lee dos archivos por título: el grande (256) que se ve en la fila
 // principal y el chico (174) que usa la pantalla de todas las aplicaciones.
-// Escribir sólo el primero dejaba el icono viejo en la lista completa.
+// Escribir sólo el primero dejaba el ícono viejo en la lista completa.
 std::string iconPathFor(const std::string& tid)
 {
     return "sdmc:/atmosphere/contents/" + tid + "/icon.jpg";
@@ -130,18 +192,18 @@ std::string smallIconPathFor(const std::string& tid)
 
 bool hasCustomIcon(const std::string& tid)
 {
-    return std::filesystem::exists(iconPathFor(tid)) || std::filesystem::exists(smallIconPathFor(tid));
+    return existe(iconPathFor(tid)) || existe(smallIconPathFor(tid));
 }
 
 bool sysmoduleInstalled()
 {
-    return std::filesystem::exists(SYSICON_PATH) || std::filesystem::exists(SYSTWEAK_PATH);
+    return existe(SYSICON_PATH) || existe(SYSTWEAK_PATH);
 }
 
 std::string sysmoduleName()
 {
-    if (std::filesystem::exists(SYSICON_PATH)) return "sys-icon";
-    if (std::filesystem::exists(SYSTWEAK_PATH)) return "sys-tweak";
+    if (existe(SYSICON_PATH)) return "sys-icon";
+    if (existe(SYSTWEAK_PATH)) return "sys-tweak";
     return "";
 }
 
@@ -151,7 +213,7 @@ std::string toLower(std::string s)
     return s;
 }
 
-// Escribe el icono donde lo lee el sysmodule: 256x256 jpg en la carpeta del
+// Escribe el ícono donde lo lee el sysmodule: 256x256 jpg en la carpeta del
 // título. El original pasaba los canales de la imagen de origen a stbi_write_jpg
 // aunque el buffer redimensionado siempre tiene 3, así que una imagen con
 // transparencia salía corrupta.
@@ -161,15 +223,17 @@ std::string toLower(std::string s)
 //   0 recortar: toma el cuadrado del centro. No deforma, pero corta arriba y abajo.
 //   1 ajustar:  entra completa, con franjas del color del borde a los lados.
 //   2 estirar:  la aplasta hasta el cuadrado (lo que hacía antes).
-//   3 tema vertical: la prepara para temas que estiran el icono a 2:3.
+//   3 tema vertical: la prepara para temas que estiran el ícono a 2:3.
 void invalidateControlCache(const std::string& tid);
 bool controlDataAvailable(u64 appId);
 
-bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE, const std::string& outPath)
+// El cuadro final (SIDE x SIDE, RGB) según el modo, sin escribir nada. Lo usan
+// renderIcon y la vista previa. Devuelve NULL si no se pudo; liberar con free.
+unsigned char* renderPixels(unsigned char* img, int width, int height, int fitMode, int SIDE)
 {
     unsigned char* out = (unsigned char*)malloc((size_t)SIDE * SIDE * 3);
     if (out == NULL)
-        return false;
+        return NULL;
 
     bool ok = false;
 
@@ -291,7 +355,22 @@ bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE
         ok = stbir_resize_uint8(img, width, height, 0, out, SIDE, SIDE, SIDE * 3, 3) != 0;
     }
 
-    // El icono viaja dentro de los datos del juego, en un hueco de 0x20000
+    if (!ok)
+    {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE, const std::string& outPath)
+{
+    unsigned char* out = renderPixels(img, width, height, fitMode, SIDE);
+    if (out == NULL)
+        return false;
+    bool ok = true;
+
+    // El ícono viaja dentro de los datos del juego, en un hueco de 0x20000
     // bytes (131.072). Si el JPEG pasa de ahí, sys-icon no lo puede usar y el
     // menú se queda con el original: era el caso de las carátulas con mucho
     // detalle guardadas a calidad 100. Se baja la calidad hasta que entre.
@@ -302,9 +381,9 @@ bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE
         // encima arrastraban al grande, que se quedaba sin cambiar tampoco.
         // 102400 y 65536 son los limites que documenta sys-ticon para FW 19.0.0+
         // y 20.0.0+. sys-icon aguanta mas en el grande, pero capando al menor de
-        // los dos el icono vale para cualquiera de los dos sysmodules, y el
+        // los dos el ícono vale para cualquiera de los dos sysmodules, y el
         // usuario no tiene que saber cual tiene instalado.
-        const size_t LIMITE = (SIDE >= 256) ? 102400 : 60000;
+        const size_t LIMITE = (SIDE >= 256) ? LIMITE_GRANDE : LIMITE_CHICO_OBJETIVO;
         const int calidades[] = { 100, 92, 85, 75, 65, 55, 45 };
         ok = false;
 
@@ -322,7 +401,7 @@ bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE
             if (size <= LIMITE)
                 break;
 
-            brls::Logger::info("icono de " + std::to_string(size) + " bytes, se reintenta con menos calidad");
+            brls::Logger::info("ícono de " + std::to_string(size) + " bytes, se reintenta con menos calidad");
         }
     }
 
@@ -330,30 +409,82 @@ bool renderIcon(unsigned char* img, int width, int height, int fitMode, int SIDE
     return ok;
 }
 
-bool overwriteIcon(const std::string& tid, const std::string& imagePath)
+/* De qué imagen salió cada ícono, para poder rehacerlos al cambiar de tema
+   (Tema): sdmc:/config/icongrabber/fuentes.json, tid -> ruta. */
+static std::mutex g_mFuentes;
+static const char FUENTES_PATH[] = "sdmc:/config/icongrabber/fuentes.json";
+
+std::map<std::string, std::string> iconSources()
+{
+    std::lock_guard<std::mutex> l(g_mFuentes);
+    std::map<std::string, std::string> out;
+    try
+    {
+        std::ifstream f(FUENTES_PATH);
+        if (!f) return out;
+        nlohmann::json j;
+        f >> j;
+        for (auto& [k, v] : j.items())
+            if (v.is_string()) out[k] = v.get<std::string>();
+    }
+    catch (const std::exception&)
+    {
+    }
+    return out;
+}
+
+static void setIconSource(const std::string& tid, const std::string& ruta)
+{
+    auto todas = iconSources();
+    std::lock_guard<std::mutex> l(g_mFuentes);
+    if (ruta.empty()) todas.erase(tid);
+    else todas[tid] = ruta;
+    nlohmann::json j = nlohmann::json::object();
+    for (auto& [k, v] : todas) j[k] = v;
+    std::error_code ec;
+    std::filesystem::create_directories("sdmc:/config/icongrabber/", ec);
+    const std::string temp = std::string(FUENTES_PATH) + ".tmp";
+    {
+        std::ofstream o(temp, std::ios::trunc);
+        o << j.dump(1);
+    }
+    std::remove(FUENTES_PATH);
+    std::rename(temp.c_str(), FUENTES_PATH);
+}
+
+static bool overwriteIconImpl(const std::string& tid, const std::string& imagePath, int fitMode);
+
+bool overwriteIcon(const std::string& tid, const std::string& imagePath, int fitMode)
+{
+    const bool ok = overwriteIconImpl(tid, imagePath, fitMode);
+    if (ok) setIconSource(tid, imagePath);
+    return ok;
+}
+
+static bool overwriteIconImpl(const std::string& tid, const std::string& imagePath, int fitMode)
 {
     int width, height, channels;
     unsigned char* img = stbi_load(imagePath.c_str(), &width, &height, &channels, 3);
     if (img == NULL || width <= 0 || height <= 0)
     {
-        brls::Application::notify("No se pudo leer la imagen");
+        avisar("No se pudo leer la imagen");
         return false;
     }
 
-    int fitMode = loadConfig().value("fit_mode", 3);
+    if (fitMode < 0 || fitMode > 3) fitMode = loadConfig().value("fit_mode", 0);
 
     std::error_code ec;
     std::filesystem::create_directories("sdmc:/atmosphere/contents/" + tid, ec);
 
     // Se borran antes de escribir: si una de las dos escrituras fallara, es
-    // preferible quedarse sin icono propio que con los dos tamaños mezclados,
+    // preferible quedarse sin ícono propio que con los dos tamaños mezclados,
     // uno nuevo y otro de la vez anterior.
     std::remove(iconPathFor(tid).c_str());
     std::remove(smallIconPathFor(tid).c_str());
 
     // Y se invalida la cache ya, con los archivos fuera. Sin este paso el menu
-    // pasa de un icono propio a otro sin ver nunca el estado intermedio, y se
-    // queda mostrando el anterior: habia que borrar el icono, volver al
+    // pasa de un ícono propio a otro sin ver nunca el estado intermedio, y se
+    // queda mostrando el anterior: habia que borrar el ícono, volver al
     // original, reiniciar, y recien entonces elegir otro. Invalidando aqui el
     // sistema refresca primero al original y despues al nuevo, que es lo mismo
     // que hacia ese rodeo manual pero sin reiniciar.
@@ -366,28 +497,50 @@ bool overwriteIcon(const std::string& tid, const std::string& imagePath)
     // Con un solo tratamiento para ambos, uno de los dos salía siempre mal.
     bool big = renderIcon(img, width, height, fitMode, 256, iconPathFor(tid));
 
-    // El icono chico manda en la lista completa y en la ventanita al cambiar de
+    // El ícono chico manda en la lista completa y en la ventanita al cambiar de
     // app. Cómo prepararlo depende del tema que uses ahí:
     //   0 no tocarlo, se queda el del juego;
     //   1 recortado, para temas que lo muestran cuadrado;
     //   2 igual que el grande, para temas que también lo muestran a lo alto.
-    int smallMode = loadConfig().value("small_mode", 0);
+    int smallMode = loadConfig().value("small_mode", 1);
     if (smallMode > 0)
     {
         int mode = (smallMode == 2) ? fitMode : 0;
         if (!renderIcon(img, width, height, mode, 174, smallIconPathFor(tid)))
-            brls::Application::notify("El icono chico no se pudo escribir");
+            avisar("El ícono chico no se pudo escribir");
     }
 
     stbi_image_free(img);
 
-    // Si el juego no está instalado, el menú sigue sirviendo su icono desde la
+    /* Lo que pasó con Smash y Mario Tennis: si un archivo pasa del tope, el
+       sysmodule no aplica NINGUNO de los dos y el juego se queda con el suyo
+       sin decir nada. Se baja la calidad hasta 45; si aun así no entra, se
+       quita el que sobra y se avisa, en vez de dejar algo que no funciona. */
+    {
+        std::error_code ec;
+        auto grande = std::filesystem::file_size(iconPathFor(tid), ec);
+        if (!ec && grande > LIMITE_GRANDE)
+        {
+            std::remove(iconPathFor(tid).c_str());
+            std::remove(smallIconPathFor(tid).c_str());
+            avisar("Esa imagen no entra en el HOME ni con menos calidad.\nPrueba con otra.");
+            return false;
+        }
+        auto chico = std::filesystem::file_size(smallIconPathFor(tid), ec);
+        if (!ec && chico > LIMITE_CHICO)
+        {
+            std::remove(smallIconPathFor(tid).c_str());
+            avisar("El ícono chico no entraba: se dejó solo el grande.");
+        }
+    }
+
+    // Si el juego no está instalado, el menú sigue sirviendo su ícono desde la
     // caché y no podemos refrescarla sin borrarle el nombre para siempre. El
     // archivo queda escrito y servirá cuando se reinstale, pero conviene
     // decirlo en vez de dejar al usuario probando una y otra vez.
     if (!controlDataAvailable(strtoull(tid.c_str(), NULL, 16)))
     {
-        brls::Application::notify("Este juego no está instalado.\nEl icono queda guardado, pero el menú\nseguirá mostrando el actual hasta reinstalarlo.");
+        avisar("Este juego no está instalado.\nEl ícono queda guardado, pero el menú\nseguirá mostrando el actual hasta reinstalarlo.");
         return big;
     }
 
@@ -399,6 +552,42 @@ bool overwriteIcon(const std::string& tid, const std::string& imagePath)
 
 static nlohmann::json g_games   = nlohmann::json::array();
 static bool g_gamesLoaded       = false;
+
+// Los juegos que Nexus Bacán instaló en el disco USB: el mapa de títulos del
+// USB y las marcas que deja en la SD (lo mismo que mira OQB Updater).
+std::set<u64> juegosEnUsb()
+{
+    std::set<u64> juegos;
+    std::ifstream f("sdmc:/atmosphere/usb_content/title_map.bin", std::ios::binary);
+    if (f)
+    {
+        std::stringstream st;
+        st << f.rdbuf();
+        const std::string b = st.str();
+        auto u32At = [&b](size_t p) { u32 v; memcpy(&v, b.data() + p, 4); return v; };
+        auto u64At = [&b](size_t p) { u64 v; memcpy(&v, b.data() + p, 8); return v; };
+        if (b.size() >= 16 && u32At(0) == 0x54425355 && u32At(4) == 1)
+        {
+            const u32 n = u32At(8);
+            if (b.size() == 16 + (size_t)n * 16)
+                for (u32 i = 0; i < n; ++i)
+                {
+                    const u64 id = u64At(16 + (size_t)i * 16);
+                    if (id) juegos.insert(id & ~0x1FFFULL);
+                }
+        }
+    }
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("sdmc:/atmosphere/usb_badges", ec))
+    {
+        const std::string n = e.path().filename().string();
+        if (n.size() != 22 || n.compare(16, 6, "-0.ubg") != 0) continue;
+        char* fin = nullptr;
+        const u64 id = strtoull(n.substr(0, 16).c_str(), &fin, 16);
+        if (id && fin && *fin == 0) juegos.insert(id & ~0x1FFFULL);
+    }
+    return juegos;
+}
 
 // El original pedía 64000 registros de golpe y cortaba el recorrido entero con
 // break si un título fallaba, así que un solo juego roto dejaba la lista a
@@ -415,6 +604,10 @@ nlohmann::json getInstalledGames()
         delete[] records;
         return games;
     }
+
+    marca("lista: usb");
+    const std::set<u64> enUsb = juegosEnUsb();
+    marca("lista: registros");
 
     int recordCount = 0;
     if (R_FAILED(nsListApplicationRecord(records, MAX_RECORDS, 0, &recordCount)))
@@ -434,25 +627,31 @@ nlohmann::json getInstalledGames()
         // pedir sus datos al almacenamiento falla; pero el menú sigue mostrando
         // su nombre porque quedan en la caché. Por eso se prueban las dos vías:
         // así los archivados también salen en la lista y se les puede dejar el
-        // icono preparado para cuando se vuelvan a instalar.
-        bool archivado = false;
-        if (R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_Storage, tid, controlData, sizeof(NsApplicationControlData), &controlSize)))
-        {
-            if (R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_CacheOnly, tid, controlData, sizeof(NsApplicationControlData), &controlSize)))
-                continue;
-            archivado = true;
-        }
+        // ícono preparado para cuando se vuelvan a instalar.
+        /* Primero la caché del HOME: no lee el juego de la tarjeta ni del USB.
+           Leer cada juego del almacenamiento tardaba 22 s con 91 juegos.
+           Archivado = sin su contenido en la consola. */
+        bool instalado = false;
+        bool archivado = R_SUCCEEDED(nsIsAnyApplicationEntityInstalled(tid, &instalado)) && !instalado;
+        if (R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_CacheOnly, tid, controlData, sizeof(NsApplicationControlData), &controlSize)) &&
+            R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_Storage, tid, controlData, sizeof(NsApplicationControlData), &controlSize)))
+            continue;
         if (R_FAILED(nacpGetLanguageEntry(&controlData->nacp, &langEntry)))
             continue;
         if (langEntry == NULL || !langEntry->name[0])
             continue;
 
-        games.push_back({ { "tid", formatApplicationId(tid) }, { "name", std::string(langEntry->name) }, { "archivado", archivado } });
+        games.push_back({ { "tid", formatApplicationId(tid) },
+                          { "name", std::string(langEntry->name) },
+                          { "author", std::string(langEntry->author) },
+                          { "archivado", archivado },
+                          { "usb", enUsb.count(tid & ~0x1FFFULL) > 0 } });
     }
 
     free(controlData);
     delete[] records;
 
+    marca("lista: " + std::to_string(games.size()) + " juegos; pdm");
     // Cuánto hace que se jugó cada uno, para poder ordenar por recientes.
     // pdm devuelve los minutos transcurridos desde la última vez: menos = más
     // reciente. flag en 0 significa que no hay dato, y esos van al final.
@@ -479,13 +678,14 @@ nlohmann::json getInstalledGames()
         pdmqryExit();
     }
 
+    marca("lista: orden");
     std::sort(games.begin(), games.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
         return toLower(a["name"].get<std::string>()) < toLower(b["name"].get<std::string>());
     });
     return games;
 }
 
-nlohmann::json& installedGames(bool refresh = false)
+nlohmann::json& installedGames(bool refresh)
 {
     if (refresh || !g_gamesLoaded)
     {
@@ -522,6 +722,10 @@ void applyCommonCurlOptions(CURL* curl)
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    // Al cerrar la app, cortar lo que esté bajando: si no, el hilo seguiría
+    // corriendo con el código ya descargado de memoria.
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int { return g_saliendo ? 1 : 0; });
 }
 
 nlohmann::json httpGetJson(const std::string& url)
@@ -532,13 +736,11 @@ nlohmann::json httpGetJson(const std::string& url)
     nlohmann::json fail;
     fail["success"] = false;
 
-    curl_global_init(CURL_GLOBAL_ALL);
+    // curl_global_init va una sola vez en main: no se puede llamar desde
+    // varios hilos a la vez, y ahora las búsquedas corren en segundo plano.
     CURL* curl = curl_easy_init();
     if (!curl)
-    {
-        curl_global_cleanup();
         return fail;
-    }
 
     struct curl_slist* headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -554,7 +756,6 @@ nlohmann::json httpGetJson(const std::string& url)
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    curl_global_cleanup();
 
     if (res != CURLE_OK)
     {
@@ -629,7 +830,7 @@ std::string downloadImage(const nlohmann::json& icon, bool thumbnail)
 
     // Una descarga cortada deja un archivo de 0 bytes en la caché y después
     // "aplicar" fallaba siempre con esa imagen. Si está vacío, se rehace.
-    if (std::filesystem::exists(outpath))
+    if (existe(outpath))
     {
         std::error_code sizeEc;
         if (std::filesystem::file_size(outpath, sizeEc) > 0 && !sizeEc)
@@ -668,26 +869,26 @@ std::string downloadImage(const nlohmann::json& icon, bool thumbnail)
 
 // Lecturas defensivas: la API devuelve null en campos que uno espera con valor,
 // y json::value() lanza excepción cuando el tipo no coincide. Eso tumbaba la app.
-std::string jstr(const nlohmann::json& j, const char* key, const std::string& def = "")
+std::string jstr(const nlohmann::json& j, const char* key, const std::string& def)
 {
     if (!j.contains(key) || j[key].is_null()) return def;
     if (j[key].is_string()) return j[key].get<std::string>();
     return j[key].dump();
 }
 
-int jint(const nlohmann::json& j, const char* key, int def = 0)
+int jint(const nlohmann::json& j, const char* key, int def)
 {
     if (!j.contains(key) || !j[key].is_number()) return def;
     return j[key].get<int>();
 }
 
-bool jbool(const nlohmann::json& j, const char* key, bool def = false)
+bool jbool(const nlohmann::json& j, const char* key, bool def)
 {
     if (!j.contains(key) || !j[key].is_boolean()) return def;
     return j[key].get<bool>();
 }
 
-// Tamaños que se pueden elegir dentro de la pantalla de iconos. El primero no
+// Tamaños que se pueden elegir dentro de la pantalla de íconos. El primero no
 // filtra nada, para que nunca quede vacía por culpa del filtro.
 std::vector<std::string> sizeChoices = {
     "Todos los tamaños",
@@ -705,12 +906,12 @@ void frame_localImages(const std::string& tid, const std::string& gameName);
 void frame_cropAdjust(const std::string& tid, const std::string& gameName, const std::string& imagePath);
 void frame_matches(const std::string& tid, const std::string& gameName, const std::string& searchTerm);
 
-// El menú HOME guarda en caché los datos de cada juego, icono incluido. Si no
+// El menú HOME guarda en caché los datos de cada juego, ícono incluido. Si no
 // se invalida, puede seguir mostrando el anterior aunque el archivo de la SD ya
 // esté cambiado: es el comando 404 de ns:am, el mismo que usa OQB-updater al
 // crear accesos directos.
 // OJO: invalidar la caché de un juego que NO está instalado le borra el nombre
-// y el icono para siempre, porque su contenido ya no está en la consola y sólo
+// y el ícono para siempre, porque su contenido ya no está en la consola y sólo
 // podría recuperarlos de los servidores de Nintendo. Por eso antes se comprueba
 // que sus datos se puedan leer del almacenamiento; si no, no se toca nada.
 bool controlDataAvailable(u64 appId)
@@ -735,6 +936,7 @@ void invalidateControlCache(const std::string& tid)
         return;
     }
 
+    g_genIconos++;
     Service srv;
     if (R_FAILED(nsGetApplicationManagerInterface(&srv)))
         return;
@@ -742,19 +944,19 @@ void invalidateControlCache(const std::string& tid)
     serviceClose(&srv);
 }
 
-// Saca el icono que trae el propio juego y lo deja en un archivo. Sirve para
-// re-prepararlo: con un tema vertical, el icono original (cuadrado) sale
+// Saca el ícono que trae el propio juego y lo deja en un archivo. Sirve para
+// re-prepararlo: con un tema vertical, el ícono original (cuadrado) sale
 // estirado, así que hay que pasarlo por el mismo tratamiento que los demás.
 bool extractOriginalIcon(const std::string& tid, std::string& outPath)
 {
     u64 appId = strtoull(tid.c_str(), NULL, 16);
 
-    // Si el juego no está instalado no hay icono original que sacar, y quitarle
+    // Si el juego no está instalado no hay ícono original que sacar, y quitarle
     // los que tiene lo dejaría sin ninguno.
     if (!controlDataAvailable(appId))
         return false;
 
-    // Con los iconos propios puestos, sys-icon devolvería esos mismos y
+    // Con los íconos propios puestos, sys-icon devolvería esos mismos y
     // acabaríamos reaplicando lo que ya había. Se quitan antes de preguntar.
     std::remove(iconPathFor(tid).c_str());
     std::remove(smallIconPathFor(tid).c_str());
@@ -789,22 +991,22 @@ bool extractOriginalIcon(const std::string& tid, std::string& outPath)
     return true;
 }
 
-// Deja el icono del juego tal cual venía, pero adaptado al modo elegido. Con un
-// tema vertical eso es lo que hace que un icono cuadrado deje de verse estirado.
+// Deja el ícono del juego tal cual venía, pero adaptado al modo elegido. Con un
+// tema vertical eso es lo que hace que un ícono cuadrado deje de verse estirado.
 bool useOriginalIconAdapted(const std::string& tid, const std::string& gameName)
 {
     std::string original;
     if (!extractOriginalIcon(tid, original))
     {
-        brls::Application::notify("No se pudo leer el icono original de " + gameName);
+        avisar("No se pudo leer el ícono original de " + gameName);
         return false;
     }
     if (!overwriteIcon(tid, original))
     {
-        brls::Application::notify("No se pudo preparar el icono original");
+        avisar("No se pudo preparar el ícono original");
         return false;
     }
-    brls::Application::notify("Icono original adaptado: " + gameName + "\nSe ve al reiniciar");
+    avisar("Ícono original adaptado: " + gameName + "\nSe ve al reiniciar");
     return true;
 }
 
@@ -812,7 +1014,7 @@ bool useOriginalIconAdapted(const std::string& tid, const std::string& gameName)
 // y no dejar que el usuario tenga que acordarse de ir a Ajustes.
 void askReboot(const std::string& mensaje)
 {
-    brls::Dialog* dialog = new brls::Dialog(mensaje + "\n\nLos iconos se ven después de reiniciar.\n¿Reiniciar ahora?");
+    brls::Dialog* dialog = new brls::Dialog(mensaje + "\n\nLos íconos se ven después de reiniciar.\n¿Reiniciar ahora?");
     dialog->addButton("Reiniciar", [](brls::View* v) {
         if (R_SUCCEEDED(spsmInitialize()))
         {
@@ -821,7 +1023,7 @@ void askReboot(const std::string& mensaje)
         }
         else
         {
-            brls::Application::notify("No se pudo reiniciar");
+            avisar("No se pudo reiniciar");
         }
     });
     dialog->addButton("Después", [dialog](brls::View* v) { dialog->close(); });
@@ -829,19 +1031,20 @@ void askReboot(const std::string& mensaje)
     dialog->open();
 }
 
-// Devolver el icono original es borrar el archivo que escribimos: el sistema
+// Devolver el ícono original es borrar el archivo que escribimos: el sistema
 // vuelve a usar el que trae el juego.
 bool restoreOriginalIcon(const std::string& tid, const std::string& gameName)
 {
     if (!hasCustomIcon(tid))
     {
-        brls::Application::notify(gameName + " ya tiene su icono original");
+        avisar(gameName + " ya tiene su ícono original");
         return false;
     }
     std::remove(iconPathFor(tid).c_str());
     std::remove(smallIconPathFor(tid).c_str());
+    setIconSource(tid, "");
     invalidateControlCache(tid);
-    brls::Application::notify("Icono original restaurado: " + gameName + "\nSe ve después de reiniciar");
+    avisar("Ícono original restaurado: " + gameName + "\nSe ve después de reiniciar");
     return true;
 }
 
@@ -851,93 +1054,9 @@ bool isImageFile(const std::filesystem::path& p)
     return ext == ".jpg" || ext == ".jpeg" || ext == ".png";
 }
 
-// Ajuste del recorte con vista previa. Cada cambio vuelve a generar la imagen
-// final y la muestra, así se elige mirando el resultado y no a ciegas.
-void frame_cropAdjust(const std::string& tid, const std::string& gameName, const std::string& imagePath)
-{
-    static int previewToggle = 0;
+// El ajuste del recorte está en vistas.cpp (VistaRecorte).
 
-    brls::ThumbnailFrame* frame = new brls::ThumbnailFrame();
-    frame->setTitle("Ajustar el recorte");
-    frame->setIcon(BOREALIS_ASSET("icon/borealis.jpg"));
-    frame->getSidebar()->setTitle(gameName);
-    frame->getSidebar()->getButton()->setLabel("Aplicar así");
-
-    brls::List* list = new brls::List();
-
-    brls::ListItem* posItem = new brls::ListItem("Posición del recorte", "", "Arriba conserva la cabeza; abajo, el título");
-
-    // Genera la previa con el recorte actual. Se alterna el nombre del archivo
-    // porque si se reescribe el mismo, la imagen que ya está en pantalla no se
-    // refresca.
-    auto refresh = [frame, posItem, imagePath]() {
-        int cropY = loadConfig().value("crop_y", 50);
-        posItem->setValue(std::to_string(cropY) + "%");
-
-        int w, h, c;
-        unsigned char* img = stbi_load(imagePath.c_str(), &w, &h, &c, 3);
-        if (img == NULL)
-            return;
-
-        std::error_code ec;
-        std::filesystem::create_directories("sdmc:/gameIcons/", ec);
-        previewToggle       = 1 - previewToggle;
-        std::string preview = std::string("sdmc:/gameIcons/preview") + std::to_string(previewToggle) + ".jpg";
-
-        if (renderIcon(img, w, h, 0, 256, preview))
-            frame->getSidebar()->setThumbnail(preview);
-        stbi_image_free(img);
-    };
-
-    auto move = [refresh](int delta) {
-        nlohmann::json c = loadConfig();
-        int cropY        = std::max(0, std::min(100, c.value("crop_y", 50) + delta));
-        c["crop_y"]      = cropY;
-        saveConfig(c);
-        refresh();
-    };
-
-    list->addView(posItem);
-
-    brls::ListItem* up = new brls::ListItem("Subir el recorte", "", "Toma una parte más alta de la imagen");
-    up->getClickEvent()->subscribe([move](brls::View* view) { move(-10); });
-    list->addView(up);
-
-    brls::ListItem* center = new brls::ListItem("Centrar");
-    center->getClickEvent()->subscribe([refresh](brls::View* view) {
-        nlohmann::json c = loadConfig();
-        c["crop_y"]      = 50;
-        saveConfig(c);
-        refresh();
-    });
-    list->addView(center);
-
-    brls::ListItem* down = new brls::ListItem("Bajar el recorte", "", "Toma una parte más baja de la imagen");
-    down->getClickEvent()->subscribe([move](brls::View* view) { move(10); });
-    list->addView(down);
-
-    brls::ListItem* apply = new brls::ListItem("Aplicar este recorte");
-    apply->getClickEvent()->subscribe([tid, gameName, imagePath](brls::View* view) {
-        if (overwriteIcon(tid, imagePath))
-            askReboot("Icono aplicado a " + gameName);
-        else
-            brls::Application::notify("No se pudo aplicar");
-    });
-    list->addView(apply);
-
-    frame->getSidebar()->getButton()->getClickEvent()->subscribe([tid, gameName, imagePath](brls::View* view) {
-        if (overwriteIcon(tid, imagePath))
-            askReboot("Icono aplicado a " + gameName);
-        else
-            brls::Application::notify("No se pudo aplicar");
-    });
-
-    refresh();
-    frame->setContentView(list);
-    brls::Application::pushView(frame);
-}
-
-// Iconos propios: cualquier imagen que el usuario deje en /iconos/ de la SD, más
+// Íconos propios: cualquier imagen que el usuario deje en /íconos/ de la SD, más
 // lo que ya se haya descargado antes. Sirve cuando SteamGridDB no tiene nada.
 void frame_localImages(const std::string& tid, const std::string& gameName)
 {
@@ -945,12 +1064,12 @@ void frame_localImages(const std::string& tid, const std::string& gameName)
     std::filesystem::create_directories(USER_ICONS_DIR, ec);
 
     brls::ThumbnailFrame* frame = new brls::ThumbnailFrame();
-    frame->setTitle("Iconos guardados en la SD");
+    frame->setTitle("Íconos guardados en la SD");
     frame->setIcon(BOREALIS_ASSET("icon/borealis.jpg"));
     frame->getSidebar()->setThumbnail(BOREALIS_ASSET("icon/borealis.jpg"));
     frame->getSidebar()->setTitle(gameName);
-    frame->getSidebar()->setSubtitle("Elegí una imagen");
-    frame->getSidebar()->getButton()->setLabel("Aplicar este icono");
+    frame->getSidebar()->setSubtitle("Elige una imagen");
+    frame->getSidebar()->getButton()->setLabel("Aplicar este ícono");
 
     brls::List* list = new brls::List();
     int added        = 0;
@@ -973,9 +1092,9 @@ void frame_localImages(const std::string& tid, const std::string& gameName)
             brls::ListItem* litem = new brls::ListItem(filename, "", origen);
             litem->getClickEvent()->subscribe([=](brls::View* view) {
                 if (overwriteIcon(tid, path))
-                    askReboot("Icono aplicado a " + gameName);
+                    askReboot("Ícono aplicado a " + gameName);
                 else
-                    brls::Application::notify("No se pudo leer esa imagen");
+                    avisar("No se pudo leer esa imagen");
             });
             litem->registerAction("Ajustar el recorte", brls::Key::Y, [tid, gameName, path] {
                 frame_cropAdjust(tid, gameName, path);
@@ -987,9 +1106,9 @@ void frame_localImages(const std::string& tid, const std::string& gameName)
                 frame->getSidebar()->setSubtitle(filename);
                 frame->getSidebar()->getButton()->getClickEvent()->subscribe([=](brls::View* view) {
                     if (overwriteIcon(tid, path))
-                        brls::Application::notify("Icono aplicado a " + gameName + "\nPulsá B para volver");
+                        avisar("Ícono aplicado a " + gameName + "\nPulsa B para volver");
                     else
-                        brls::Application::notify("No se pudo aplicar esa imagen");
+                        avisar("No se pudo aplicar esa imagen");
                 });
             });
             list->addView(litem);
@@ -998,7 +1117,7 @@ void frame_localImages(const std::string& tid, const std::string& gameName)
     }
 
     if (added == 0)
-        list->addView(new brls::ListItem("No hay imágenes todavía", "Copiá archivos .jpg o .png a la carpeta /iconos/ de la SD"));
+        list->addView(new brls::ListItem("No hay imágenes todavía", "Copia archivos .jpg o .png a la carpeta /íconos/ de la SD"));
 
     frame->setContentView(list);
     brls::Application::pushView(frame);
@@ -1015,8 +1134,8 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
     frame->setIcon(BOREALIS_ASSET("icon/borealis.jpg"));
     frame->getSidebar()->setThumbnail(BOREALIS_ASSET("icon/borealis.jpg"));
     frame->getSidebar()->setTitle(gameName);
-    frame->getSidebar()->setSubtitle("Elegí un icono");
-    frame->getSidebar()->getButton()->setLabel("Aplicar este icono");
+    frame->getSidebar()->setSubtitle("Elige un ícono");
+    frame->getSidebar()->getButton()->setLabel("Aplicar este ícono");
 
     nlohmann::json icons = requestIcons(gameId, styleId, resolutionId);
 
@@ -1025,11 +1144,11 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
     // Un ListItem normal, no un SelectListItem: el evento de ese último se
     // dispara mientras su propio desplegable se está cerrando, y abrir otra
     // pantalla desde ahí congelaba la app.
-    brls::ListItem* sizeItem = new brls::ListItem("Tamaño", "", "Elegí con qué medida buscar");
+    brls::ListItem* sizeItem = new brls::ListItem("Tamaño", "", "Elige con qué medida buscar");
     sizeItem->setValue(sizeChoices[sizeChoice]);
     sizeItem->getClickEvent()->subscribe([tid, gameName, gameId, sizeChoice](brls::View* view) {
         brls::AppletFrame* picker = new brls::AppletFrame(true, true);
-        picker->setTitle("Tamaño del icono");
+        picker->setTitle("Tamaño del ícono");
         picker->setIcon(BOREALIS_ASSET("icon/borealis.jpg"));
         brls::List* opts = new brls::List();
         for (size_t i = 0; i < sizeChoices.size(); i++)
@@ -1049,7 +1168,7 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
 
     if (hasCustomIcon(tid))
     {
-        brls::ListItem* restore = new brls::ListItem("Restaurar el icono original", "", "Quita el icono que le pusiste a este juego");
+        brls::ListItem* restore = new brls::ListItem("Restaurar el ícono original", "", "Quita el ícono que le pusiste a este juego");
         restore->getClickEvent()->subscribe([tid, gameName, restore](brls::View* view) {
             if (restoreOriginalIcon(tid, gameName))
                 restore->setValue("hecho");
@@ -1057,19 +1176,19 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
         list->addView(restore);
     }
 
-    // Salida manual por si el menu se queda mostrando un icono viejo. Normalmente
-    // no hace falta, porque aplicar ya invalida la cache; esta aqui para no tener
-    // que recurrir al rodeo de quitar el icono, reiniciar y volver a ponerlo.
-    brls::ListItem* refresh = new brls::ListItem("Refrescar la caché del menú", "", "Si el menú sigue mostrando el icono anterior");
+    // Salida manual por si el menu se queda mostrando un ícono viejo. Normalmente
+    // no hace falta, porque aplicar ya invalida la cache; está aquí para no tener
+    // que recurrir al rodeo de quitar el ícono, reiniciar y volver a ponerlo.
+    brls::ListItem* refresh = new brls::ListItem("Refrescar la caché del menú", "", "Si el menú sigue mostrando el ícono anterior");
     refresh->getClickEvent()->subscribe([tid, gameName, refresh](brls::View* view) {
         if (!controlDataAvailable(strtoull(tid.c_str(), NULL, 16)))
         {
-            brls::Application::notify("Este juego no está instalado.\nRefrescar su caché le borraría el nombre\ny el icono, así que no se toca.");
+            avisar("Este juego no está instalado.\nRefrescar su caché le borraría el nombre\ny el ícono, así que no se toca.");
             return;
         }
         invalidateControlCache(tid);
         refresh->setValue("hecho");
-        brls::Application::notify("Caché refrescada para " + gameName);
+        avisar("Caché refrescada para " + gameName);
     });
     list->addView(refresh);
 
@@ -1087,7 +1206,7 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
             if (jbool(it, "lock"))
                 continue;
 
-            std::string label = jstr(it, "style", "icono");
+            std::string label = jstr(it, "style", "ícono");
             label.append(" · ");
             label.append(std::to_string(jint(it, "width")));
             label.append("x");
@@ -1096,28 +1215,28 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
             brls::ListItem* litem = new brls::ListItem(label);
 
             // Aplicar directamente con A. El botón lateral sólo funciona si el
-            // icono llegó a tener el foco, y eso dejaba la impresión de que la
-            // app se colgaba: al entrar, el foco está en "Tamaño", no en un icono.
+            // ícono llegó a tener el foco, y eso dejaba la impresión de que la
+            // app se colgaba: al entrar, el foco está en "Tamaño", no en un ícono.
             litem->getClickEvent()->subscribe([=](brls::View* view) {
-                brls::Application::notify("Descargando…");
+                avisar("Descargando…");
                 std::string full = downloadImage(it, false);
                 if (full.empty())
                 {
-                    brls::Application::notify("No se pudo descargar esa imagen");
+                    avisar("No se pudo descargar esa imagen");
                     return;
                 }
                 if (overwriteIcon(tid, full))
-                    brls::Application::notify("Icono aplicado a " + gameName + "\nSe ve al reiniciar");
+                    avisar("Ícono aplicado a " + gameName + "\nSe ve al reiniciar");
                 else
-                    brls::Application::notify("La imagen descargada no se pudo leer");
+                    avisar("La imagen descargada no se pudo leer");
             });
 
             litem->registerAction("Ajustar el recorte", brls::Key::Y, [=] {
-                brls::Application::notify("Descargando…");
+                avisar("Descargando…");
                 std::string full = downloadImage(it, false);
                 if (full.empty())
                 {
-                    brls::Application::notify("No se pudo descargar esa imagen");
+                    avisar("No se pudo descargar esa imagen");
                     return true;
                 }
                 frame_cropAdjust(tid, gameName, full);
@@ -1138,17 +1257,17 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
                     frame->getSidebar()->setSubtitle("Sin vista previa");
                 }
                 frame->getSidebar()->getButton()->getClickEvent()->subscribe([=](brls::View* view) {
-                    brls::Application::notify("Descargando…");
+                    avisar("Descargando…");
                     std::string full = downloadImage(it, false);
                     if (full.empty())
                     {
-                        brls::Application::notify("No se pudo descargar");
+                        avisar("No se pudo descargar");
                         return;
                     }
                     if (overwriteIcon(tid, full))
-                        askReboot("Icono aplicado a " + gameName);
+                        askReboot("Ícono aplicado a " + gameName);
                     else
-                        brls::Application::notify("La imagen descargada no se pudo leer");
+                        avisar("La imagen descargada no se pudo leer");
                 });
             });
             list->addView(litem);
@@ -1158,8 +1277,8 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
 
     if (added == 0)
     {
-        std::string detalle = icons.contains("error") ? jstr(icons, "error") : "Probá con otro tamaño acá arriba";
-        list->addView(new brls::ListItem("Sin iconos con este filtro", detalle));
+        std::string detalle = icons.contains("error") ? jstr(icons, "error") : "Prueba con otro tamaño aquí arriba";
+        list->addView(new brls::ListItem("Sin íconos con este filtro", detalle));
     }
 
     frame->setContentView(list);
@@ -1178,7 +1297,7 @@ void frame_matches(const std::string& tid, const std::string& gameName, const st
     nlohmann::json found = requestGames(searchTerm);
     brls::List* list     = new brls::List();
 
-    brls::ListItem* adapt = new brls::ListItem("Usar el icono original del juego", "", "Lo adapta al tema, para que no salga estirado");
+    brls::ListItem* adapt = new brls::ListItem("Usar el ícono original del juego", "", "Lo adapta al tema, para que no salga estirado");
     adapt->getClickEvent()->subscribe([tid, gameName, adapt](brls::View* view) {
         if (useOriginalIconAdapted(tid, gameName))
             adapt->setValue("hecho");
@@ -1187,7 +1306,7 @@ void frame_matches(const std::string& tid, const std::string& gameName, const st
 
     if (hasCustomIcon(tid))
     {
-        brls::ListItem* restore = new brls::ListItem("Quitar el icono personalizado", "", "Vuelve al icono del juego, sin adaptar");
+        brls::ListItem* restore = new brls::ListItem("Quitar el ícono personalizado", "", "Vuelve al ícono del juego, sin adaptar");
         restore->getClickEvent()->subscribe([tid, gameName, restore](brls::View* view) {
             if (restoreOriginalIcon(tid, gameName))
                 restore->setValue("hecho");
@@ -1216,7 +1335,7 @@ void frame_matches(const std::string& tid, const std::string& gameName, const st
 
     if (added == 0)
     {
-        std::string detalle = found.contains("error") ? jstr(found, "error") : "Pulsá X y escribí otro nombre";
+        std::string detalle = found.contains("error") ? jstr(found, "error") : "Pulsa X y escribe otro nombre";
         list->addView(new brls::ListItem("Sin coincidencias para: " + searchTerm, detalle));
     }
 
@@ -1279,9 +1398,9 @@ void fillGameList(brls::List* list, const std::string& filter)
             continue;
 
         bool archivado        = it.value("archivado", false);
-        brls::ListItem* litem = new brls::ListItem(name, "", archivado ? "archivado: el icono queda listo para cuando lo reinstales" : "");
+        brls::ListItem* litem = new brls::ListItem(name, "", archivado ? "archivado: el ícono queda listo para cuando lo reinstales" : "");
         if (hasCustomIcon(tid))
-            litem->setValue("icono propio");
+            litem->setValue("ícono propio");
         else if (archivado)
             litem->setValue("archivado", true);
 
@@ -1289,13 +1408,13 @@ void fillGameList(brls::List* list, const std::string& filter)
             frame_matches(tid, name, name);
         });
 
-        litem->registerAction("Icono original adaptado al tema", brls::Key::PLUS, [tid, name, litem] {
+        litem->registerAction("Ícono original adaptado al tema", brls::Key::PLUS, [tid, name, litem] {
             if (useOriginalIconAdapted(tid, name))
-                litem->setValue("icono propio");
+                litem->setValue("ícono propio");
             return true;
         });
 
-        litem->registerAction("Restaurar icono original", brls::Key::X, [tid, name, litem] {
+        litem->registerAction("Restaurar ícono original", brls::Key::X, [tid, name, litem] {
             if (restoreOriginalIcon(tid, name))
                 litem->setValue("");
             return true;
@@ -1309,7 +1428,7 @@ void fillGameList(brls::List* list, const std::string& filter)
     {
         brls::ListItem* empty = new brls::ListItem(
             filter.empty() ? "No se encontraron juegos instalados" : "Ningún juego coincide con: " + filter,
-            filter.empty() ? "" : "Pulsá Y para buscar otra cosa");
+            filter.empty() ? "" : "Pulsa Y para buscar otra cosa");
         list->addView(empty);
     }
 }
@@ -1344,8 +1463,8 @@ bool setSidebarImage(brls::ThumbnailSidebar* sidebar, const std::string& path)
 }
 
 // ------------------------------------------------------------- perfiles ---
-// Un perfil es una copia de todos los iconos puestos, guardada en
-// /iconos/perfiles/<nombre>/<tid>/. Sirve para tener un juego de iconos por
+// Un perfil es una copia de todos los íconos puestos, guardada en
+// /íconos/perfiles/<nombre>/<tid>/. Sirve para tener un juego de íconos por
 // tema: verticales para uno, cuadrados para otro, y cambiar de golpe.
 
 std::vector<std::string> listProfiles()
@@ -1363,7 +1482,7 @@ std::vector<std::string> listProfiles()
     return out;
 }
 
-// Recorre las carpetas de contents y se queda con las que tienen iconos
+// Recorre las carpetas de contents y se queda con las que tienen íconos
 // nuestros. Nunca toca nada más de esas carpetas: ahí también viven los mods.
 std::vector<std::string> titlesWithIcons()
 {
@@ -1434,7 +1553,7 @@ int saveProfile(const std::string& nombre)
         // Antes se contaba el titulo pasara lo que pasara y los errores de copia
         // se tragaban, asi que un perfil podia quedarse con carpetas vacias y aun
         // asi decir que habia guardado N juegos. Luego, al abrirlo, no habia
-        // iconos que mostrar y no habia forma de saber por que.
+        // íconos que mostrar y no habia forma de saber por que.
         int archivosCopiados = 0;
         for (const std::string& archivo : { std::string("icon.jpg"), std::string("icon174.jpg") })
         {
@@ -1456,9 +1575,37 @@ int saveProfile(const std::string& nombre)
         if (archivosCopiados > 0)
             copiados++;
         else
-            std::filesystem::remove_all(dest + tid, ec);  // sin iconos, no dejar la carpeta
+            std::filesystem::remove_all(dest + tid, ec);  // sin íconos, no dejar la carpeta
     }
+
+    // El tema con el que se armaron: al aplicar el perfil se vuelve a él.
+    const nlohmann::json c = loadConfig();
+    nlohmann::json info;
+    info["fit_mode"]   = c.value("fit_mode", 0);
+    info["small_mode"] = c.value("small_mode", 1);
+    std::ofstream o(dest + "perfil.json", std::ios::trunc);
+    o << info.dump(1);
     return copiados;
+}
+
+// «Tema vertical», «Cuadrado» o vacío (perfiles de antes de la 3.0).
+std::string profileTheme(const std::string& nombre)
+{
+    try
+    {
+        std::ifstream f(PROFILES_DIR + nombre + "/perfil.json");
+        if (!f) return "";
+        nlohmann::json j;
+        f >> j;
+        const int fit = j.value("fit_mode", 0), chico = j.value("small_mode", 1);
+        if (fit == 3 && chico == 0) return "Tema con HOME vertical";
+        if (fit == 0 && chico == 1) return "Tema normal (cuadrado)";
+        return "Combinación propia";
+    }
+    catch (const std::exception&)
+    {
+        return "";
+    }
 }
 
 int applyProfile(const std::string& nombre)
@@ -1466,6 +1613,28 @@ int applyProfile(const std::string& nombre)
     std::error_code ec;
     std::string origen = PROFILES_DIR + nombre + "/";
     int puestos = 0;
+
+    // Un perfil es un juego completo de íconos para su tema: primero se quitan
+    // los que hay (pueden ser del otro tema) y después se ponen los suyos.
+    removeAllIcons();
+
+    // Su tema, para que lo que pongas después salga igual.
+    try
+    {
+        std::ifstream f(origen + "perfil.json");
+        if (f)
+        {
+            nlohmann::json j;
+            f >> j;
+            nlohmann::json c   = loadConfig();
+            c["fit_mode"]      = j.value("fit_mode", c.value("fit_mode", 0));
+            c["small_mode"]    = j.value("small_mode", c.value("small_mode", 1));
+            saveConfig(c);
+        }
+    }
+    catch (const std::exception&)
+    {
+    }
 
     for (const auto& entry : std::filesystem::directory_iterator(origen, ec))
     {
@@ -1495,7 +1664,7 @@ int applyProfile(const std::string& nombre)
     return puestos;
 }
 
-// Deja la consola con los iconos de siempre. Sólo borra los dos archivos que
+// Deja la consola con los íconos de siempre. Sólo borra los dos archivos que
 // escribimos nosotros; lo demás de cada carpeta se queda intacto.
 int removeAllIcons()
 {
@@ -1510,7 +1679,7 @@ int removeAllIcons()
     return quitados;
 }
 
-// Abre un perfil y muestra sus iconos uno por uno, con vista previa. Desde acá
+// Abre un perfil y muestra sus íconos uno por uno, con vista previa. Desde aquí
 // se puede aplicar el perfil entero o sólo el de un juego.
 void frame_profile(const std::string& nombre)
 {
@@ -1519,18 +1688,21 @@ void frame_profile(const std::string& nombre)
     frame->setIcon(BOREALIS_ASSET("icon/borealis.jpg"));
     frame->getSidebar()->setThumbnail(BOREALIS_ASSET("icon/borealis.jpg"));
     frame->getSidebar()->setTitle(nombre);
-    frame->getSidebar()->setSubtitle("Elegí un juego");
+    frame->getSidebar()->setSubtitle("Elige un juego");
     frame->getSidebar()->getButton()->setLabel("Aplicar sólo este");
 
     brls::List* list = new brls::List();
 
     brls::ListItem* todos = new brls::ListItem("Aplicar todo el perfil");
     todos->getClickEvent()->subscribe([nombre](brls::View* view) {
-        brls::Dialog* dialog = new brls::Dialog("Aplicar el perfil entero.\n\nLa pantalla se queda quieta un momento.\n¿Seguimos?");
+        const std::string tema = profileTheme(nombre);
+        brls::Dialog* dialog = new brls::Dialog("¿Aplicar el perfil «" + nombre + "»?\n\n" + (tema.empty() ? "" : tema + ".\n") + "Se quitan tus íconos actuales y se ponen los del perfil, con su tema.");
         dialog->addButton("Aplicar", [dialog, nombre](brls::View* v) {
-            dialog->close();
-            int n = applyProfile(nombre);
-            askReboot("Perfil aplicado a " + std::to_string(n) + " juegos");
+            dialog->close([nombre] {
+                enSegundoPlano("Aplicar perfil", nombre, [nombre](std::function<void(int, int)>) {
+                    return "Perfil aplicado a " + std::to_string(applyProfile(nombre)) + " juegos, con su tema.";
+                }, true);
+            });
         });
         dialog->addButton("Cancelar", [dialog](brls::View* v) { dialog->close(); });
         dialog->setCancelable(true);
@@ -1574,7 +1746,7 @@ void frame_profile(const std::string& nombre)
             if (std::filesystem::exists(small, ec2))
                 copyFileRaw(small, dest + "icon174.jpg");
             invalidateControlCache(tid);
-            brls::Application::notify("Aplicado a " + etiqueta + "\nSe ve al reiniciar");
+            avisar("Aplicado a " + etiqueta + "\nSe ve al reiniciar");
         };
 
         item->getClickEvent()->subscribe([aplicarUno](brls::View* view) { aplicarUno(); });
@@ -1592,7 +1764,7 @@ void frame_profile(const std::string& nombre)
             std::error_code ec2;
             std::filesystem::remove_all(PROFILES_DIR + nombre + "/" + tid, ec2);
             item->setValue("quitado");
-            brls::Application::notify("Quitado del perfil");
+            avisar("Quitado del perfil");
             return true;
         });
 
@@ -1629,26 +1801,34 @@ void addProfileRows(brls::List* list);
 
 void fillProfilesTab(brls::List* list)
 {
-    brls::ListItem* guardar = new brls::ListItem("Guardar los iconos actuales", "", "Crea un perfil con todo lo que tenés puesto ahora");
+    brls::ListItem* guardar = new brls::ListItem("Guardar los íconos actuales", "", "Crea un perfil con todo lo que tienes puesto ahora");
     guardar->getClickEvent()->subscribe([list](brls::View* view) {
+        // Un nombre sugerido según el tema; se puede cambiar.
+        const nlohmann::json c = loadConfig();
+        const std::string base = c.value("fit_mode", 0) == 3 ? "Vertical" : "Cuadrado";
+        int n = 1;
+        std::error_code ec;
+        while (std::filesystem::exists(PROFILES_DIR + base + " " + std::to_string(n), ec)) n++;
         brls::Swkbd::openForText([list](std::string nombre) {
+            nombre.erase(std::remove_if(nombre.begin(), nombre.end(), [](char ch) { return ch == '/' || ch == '\\' || ch == ':'; }), nombre.end());
             if (nombre.empty())
                 return;
             int n = saveProfile(nombre);
-            brls::Application::notify("Perfil \"" + nombre + "\": " + std::to_string(n) + " juegos guardados");
+            avisar("Perfil \"" + nombre + "\": " + std::to_string(n) + " juegos guardados, con su tema");
             rebuildProfilesTab(list);
-        }, "Nombre del perfil", "", 32, "perfil 1");
+        }, "Nombre del perfil", "Guarda tus íconos y el tema", 32, base + " " + std::to_string(n));
     });
     list->addView(guardar);
 
-    brls::ListItem* quitar = new brls::ListItem("Dejar todos los iconos originales", "", "Quita los tuyos; útil al volver a un tema cuadrado");
+    brls::ListItem* quitar = new brls::ListItem("Dejar todos los íconos originales", "", "Quita los tuyos de todos los juegos (los perfiles no se tocan)");
     quitar->getClickEvent()->subscribe([list](brls::View* view) {
-        brls::Dialog* dialog = new brls::Dialog("Se van a quitar tus iconos de todos los juegos.\n\nLos perfiles guardados no se tocan, así que podés volver cuando quieras.\n¿Seguimos?");
-        dialog->addButton("Quitar", [dialog, list](brls::View* v) {
-            dialog->close();
-            int n = removeAllIcons();
-            rebuildProfilesTab(list);
-            askReboot("Quitados los iconos de " + std::to_string(n) + " juegos");
+        brls::Dialog* dialog = new brls::Dialog("Se van a quitar tus íconos de todos los juegos.\n\nLos perfiles guardados no se tocan, así que puedes volver cuando quieras.\n¿Seguimos?");
+        dialog->addButton("Quitar", [dialog](brls::View* v) {
+            dialog->close([] {
+                enSegundoPlano("Íconos originales", "Se quitan los tuyos de todos los juegos.", [](std::function<void(int, int)>) {
+                    return "Quitados los íconos de " + std::to_string(removeAllIcons()) + " juegos.";
+                }, true);
+            });
         });
         dialog->addButton("Cancelar", [dialog](brls::View* v) { dialog->close(); });
         dialog->setCancelable(true);
@@ -1668,237 +1848,267 @@ void addProfileRows(brls::List* list)
         return;
     }
 
+    // Agrupados por tema: primero los cuadrados, después los de HOME vertical.
+    std::stable_sort(perfiles.begin(), perfiles.end(), [](const std::string& a, const std::string& b) {
+        auto orden = [](const std::string& t) { return t == "Tema normal (cuadrado)" ? 0 : t == "Tema con HOME vertical" ? 1 : 2; };
+        return orden(profileTheme(a)) < orden(profileTheme(b));
+    });
+    std::string grupo = "-";
     for (const std::string& nombre : perfiles)
     {
+        const std::string temaGrupo = profileTheme(nombre);
+        if (temaGrupo != grupo)
+        {
+            grupo = temaGrupo;
+            list->addView(new brls::Header(grupo.empty() ? "Sin tema guardado (de antes)" : grupo));
+        }
         std::error_code ec;
         int juegos = 0;
         for (const auto& e : std::filesystem::directory_iterator(PROFILES_DIR + nombre, ec))
             if (!ec && e.is_directory(ec)) juegos++;
 
-        brls::ListItem* item = new brls::ListItem(nombre, "", std::to_string(juegos) + " juegos · A para verlo, X para borrarlo");
-        item->getClickEvent()->subscribe([nombre](brls::View* view) {
-            frame_profile(nombre);
+        const std::string tema = profileTheme(nombre);
+        auto actual = std::make_shared<std::string>(nombre);  // cambia si se renombra
+        brls::ListItem* item = new brls::ListItem(nombre, "", std::to_string(juegos) + (juegos == 1 ? " juego" : " juegos") + " · A verlo · Y renombrar · X borrar");
+        item->getClickEvent()->subscribe([actual](brls::View* view) {
+            frame_profile(*actual);
         });
-        item->registerAction("Borrar el perfil", brls::Key::X, [nombre, item] {
+        item->registerAction("Renombrar", brls::Key::Y, [actual, item] {
+            brls::Swkbd::openForText([actual, item](std::string nuevo) {
+                nuevo.erase(std::remove_if(nuevo.begin(), nuevo.end(), [](char ch) { return ch == '/' || ch == '\\' || ch == ':'; }), nuevo.end());
+                if (nuevo.empty() || nuevo == *actual) return;
+                std::error_code ec;
+                if (std::filesystem::exists(PROFILES_DIR + nuevo, ec))
+                {
+                    avisar("Ya hay un perfil con ese nombre");
+                    return;
+                }
+                if (std::rename((PROFILES_DIR + *actual).c_str(), (PROFILES_DIR + nuevo).c_str()) != 0)
+                {
+                    avisar("No se pudo renombrar");
+                    return;
+                }
+                *actual = nuevo;
+                item->setLabel(nuevo);
+                avisar("Perfil renombrado");
+            }, "Nuevo nombre del perfil", "", 32, *actual);
+            return true;
+        });
+        item->registerAction("Borrar el perfil", brls::Key::X, [actual, item] {
             std::error_code ec;
-            std::filesystem::remove_all(PROFILES_DIR + nombre, ec);
+            std::filesystem::remove_all(PROFILES_DIR + *actual, ec);
             item->setValue("borrado");
-            brls::Application::notify("Perfil borrado: " + nombre);
+            avisar("Perfil borrado: " + *actual);
             return true;
         });
         list->addView(item);
     }
 }
 
-// --------------------------------------------------------------- main ----
 
-int main(int argc, char* argv[])
+// ------------------------------------------------------ rediseño (3.0) ----
+
+std::vector<unsigned char> previewRGBA(const std::string& imagePath, int fitMode, int side)
 {
-    nsInitialize();
-    socketInitializeDefault();
-
-    brls::Logger::setLogLevel(brls::LogLevel::INFO);
-    i18n::loadTranslations();
-    if (!brls::Application::init("main/name"_i18n))
+    std::vector<unsigned char> rgba;
+    int w, h, c;
+    unsigned char* img = stbi_load(imagePath.c_str(), &w, &h, &c, 3);
+    if (img == NULL)
+        return rgba;
+    unsigned char* rgb = renderPixels(img, w, h, fitMode, side);
+    stbi_image_free(img);
+    if (rgb == NULL)
+        return rgba;
+    rgba.resize((size_t)side * side * 4);
+    for (size_t i = 0; i < (size_t)side * side; i++)
     {
-        brls::Logger::error("Unable to init Borealis application");
-        return EXIT_FAILURE;
+        rgba[i * 4 + 0] = rgb[i * 3 + 0];
+        rgba[i * 4 + 1] = rgb[i * 3 + 1];
+        rgba[i * 4 + 2] = rgb[i * 3 + 2];
+        rgba[i * 4 + 3] = 255;
     }
-
-    nlohmann::json config = loadConfig();
-
-    std::error_code ec;
-    std::filesystem::create_directories(USER_ICONS_DIR, ec);
-
-    brls::TabFrame* rootFrame = new brls::TabFrame();
-    rootFrame->setTitle("IconGrabber OQB");
-    rootFrame->setIcon(BOREALIS_ASSET("icon/borealis.jpg"));
-
-    // --- pestaña de juegos: el único recorrido que hace falta ---
-    brls::List* gamesTab = new brls::List();
-    static std::string currentFilter = "";
-    fillGameList(gamesTab, currentFilter);
-
-    rootFrame->registerAction("Buscar juego", brls::Key::Y, [gamesTab] {
-        brls::Swkbd::openForText([gamesTab](std::string text) {
-            currentFilter = text;
-            rebuildGameList(gamesTab, currentFilter);
-        }, "Buscar entre los juegos instalados", "", 64, currentFilter);
-        return true;
-    });
-
-    rootFrame->registerAction("Recargar lista", brls::Key::MINUS, [gamesTab] {
-        installedGames(true);
-        rebuildGameList(gamesTab, currentFilter);
-        brls::Application::notify("Lista actualizada");
-        return true;
-    });
-
-    // --- pestaña de ajustes ---
-    brls::List* settingsTab = new brls::List();
-
-    std::string sysStatus = sysmoduleInstalled()
-        ? sysmoduleName() + " instalado"
-        : "Falta el sysmodule: sin él los iconos no cambian";
-    brls::ListItem* sysItem = new brls::ListItem("Sysmodule", sysStatus);
-    settingsTab->addView(sysItem);
-
-    brls::InputListItem* settingApiToken = new brls::InputListItem("Token de la API", config["api_token"], "Pegá tu token de steamgriddb.com", "Se saca gratis en steamgriddb.com", 64);
-    brls::SelectListItem* settingStyles  = new brls::SelectListItem("Estilo de icono", allowedStyles, config["style_id"]);
-
-    settingApiToken->getClickEvent()->subscribe([settingApiToken](brls::View* view) {
-        nlohmann::json c = loadConfig();
-        c["api_token"]   = settingApiToken->getValue();
-        saveConfig(c);
-    });
-    settingStyles->getValueSelectedEvent()->subscribe([](size_t selection) {
-        nlohmann::json c = loadConfig();
-        c["style_id"]    = selection;
-        saveConfig(c);
-    });
-
-    // sys-icon aplica los iconos al arrancar, así que hace falta reiniciar para
-    // verlos. Tenerlo acá evita salir de la app y pelearse con el menú de power.
-    std::vector<std::string> fitNames = { "recortar", "ajustar", "estirar", "tema vertical 2:3" };
-    brls::ListItem* fitItem = new brls::ListItem("Imágenes no cuadradas", "", "Cómo encajarlas en el cuadro del menú HOME");
-    fitItem->setValue(fitNames[loadConfig().value("fit_mode", 3)]);
-    fitItem->getClickEvent()->subscribe([fitItem, fitNames](brls::View* view) {
-        nlohmann::json c = loadConfig();
-        int mode         = (c.value("fit_mode", 3) + 1) % 4;
-        c["fit_mode"]    = mode;
-        saveConfig(c);
-        fitItem->setValue(fitNames[mode]);
-        const char* detalle[4] = { "Toma el centro, sin deformar", "Entra completa, con franjas", "La aplasta al cuadro", "Vertical en el tema y recortado donde va cuadrado" };
-        brls::Application::notify(detalle[mode]);
-    });
-
-    std::vector<std::string> smallNames = { "se deja el original", "recortado", "igual que el grande" };
-    // Con un tema vertical, los juegos que nunca tocaste siguen mostrando su
-    // icono cuadrado y el tema los estira. Esto recorre esos y les deja su
-    // propio icono, pero ya preparado, sin buscar imágenes en ningún lado.
-    brls::ListItem* adaptAll = new brls::ListItem("Adaptar todos los juegos al tema", "", "Usa el icono propio de cada uno, preparado para el tema");
-    adaptAll->getClickEvent()->subscribe([gamesTab](brls::View* view) {
-        nlohmann::json& games = installedGames();
-        int pendientes        = 0;
-        for (auto it : games)
-            if (!hasCustomIcon(it["tid"].get<std::string>()))
-                pendientes++;
-
-        if (pendientes == 0)
-        {
-            brls::Application::notify("Todos los juegos ya tienen icono propio");
-            return;
-        }
-
-        brls::Dialog* dialog = new brls::Dialog(
-            "Se van a adaptar " + std::to_string(pendientes) + " juegos.\n\nLa pantalla se queda quieta mientras trabaja; puede tardar un rato.\n¿Seguimos?");
-        dialog->addButton("Adaptar", [dialog, gamesTab](brls::View* v) {
-            dialog->close();
-            nlohmann::json& games = installedGames();
-            int hechos = 0, fallados = 0;
-            for (auto it : games)
-            {
-                std::string tid  = it["tid"].get<std::string>();
-                std::string name = it["name"].get<std::string>();
-                if (hasCustomIcon(tid) || it.value("archivado", false))
-                    continue;
-
-                std::string original;
-                if (extractOriginalIcon(tid, original) && overwriteIcon(tid, original))
-                    hechos++;
-                else
-                    fallados++;
-            }
-            rebuildGameList(gamesTab, currentFilter);
-            std::string resumen = "Adaptados " + std::to_string(hechos) + " juegos";
-            if (fallados)
-                resumen += ", " + std::to_string(fallados) + " no se pudieron";
-            askReboot(resumen);
-        });
-        dialog->addButton("Cancelar", [dialog](brls::View* v) { dialog->close(); });
-        dialog->setCancelable(true);
-        dialog->open();
-    });
-
-    brls::ListItem* smallItem = new brls::ListItem("Icono chico", "", "El de la lista completa y la ventanita al cambiar de app");
-    smallItem->setValue(smallNames[loadConfig().value("small_mode", 0)]);
-    smallItem->getClickEvent()->subscribe([smallItem, smallNames](brls::View* view) {
-        nlohmann::json c  = loadConfig();
-        int mode          = (c.value("small_mode", 0) + 1) % 3;
-        c["small_mode"]   = mode;
-        saveConfig(c);
-        smallItem->setValue(smallNames[mode]);
-        const char* detalle[3] = { "No se toca el icono del juego",
-                                   "Para temas que lo muestran cuadrado",
-                                   "Para temas que también lo muestran a lo alto" };
-        brls::Application::notify(detalle[mode]);
-    });
-
-    brls::ListItem* sortItem = new brls::ListItem("Orden de la lista", "", "Alfabético o por lo último que jugaste");
-    sortItem->setValue(loadConfig().value("sort_recent", false) ? "recientes" : "alfabético");
-    sortItem->getClickEvent()->subscribe([sortItem, gamesTab](brls::View* view) {
-        nlohmann::json c = loadConfig();
-        bool recent      = !c.value("sort_recent", false);
-        c["sort_recent"] = recent;
-        saveConfig(c);
-        sortItem->setValue(recent ? "recientes" : "alfabético");
-        rebuildGameList(gamesTab, currentFilter);
-        brls::Application::notify(recent ? "Ordenado por recientes" : "Ordenado por nombre");
-    });
-
-    brls::ListItem* rebootItem = new brls::ListItem("Reiniciar la consola", "Los iconos nuevos se ven después de reiniciar");
-    rebootItem->getClickEvent()->subscribe([](brls::View* view) {
-        brls::Dialog* dialog = new brls::Dialog("¿Reiniciar ahora?\nCerrá cualquier juego antes de seguir.");
-        dialog->addButton("Reiniciar", [dialog](brls::View* v) {
-            if (R_SUCCEEDED(spsmInitialize()))
-            {
-                spsmShutdown(true);
-                spsmExit();
-            }
-            else
-            {
-                brls::Application::notify("No se pudo reiniciar");
-                dialog->close();
-            }
-        });
-        dialog->addButton("Cancelar", [dialog](brls::View* v) { dialog->close(); });
-        dialog->setCancelable(true);
-        dialog->open();
-    });
-
-    brls::ListItem* deleteIconCache = new brls::ListItem("Borrar caché de imágenes", "No toca los iconos ya aplicados");
-    deleteIconCache->getClickEvent()->subscribe([](brls::View* view) {
-        std::error_code ec;
-        std::filesystem::remove_all("sdmc:/gameIcons/full/", ec);
-        std::filesystem::remove_all("sdmc:/gameIcons/thumbnails/", ec);
-        std::filesystem::create_directories("sdmc:/gameIcons/full/", ec);
-        std::filesystem::create_directories("sdmc:/gameIcons/thumbnails/", ec);
-        brls::Application::notify("Caché borrada");
-    });
-
-    settingsTab->addView(settingApiToken);
-    settingsTab->addView(settingStyles);
-    settingsTab->addView(fitItem);
-    settingsTab->addView(smallItem);
-    settingsTab->addView(adaptAll);
-    settingsTab->addView(sortItem);
-    settingsTab->addView(rebootItem);
-    settingsTab->addView(deleteIconCache);
-
-    brls::List* profilesTab = new brls::List();
-    fillProfilesTab(profilesTab);
-
-    rootFrame->addTab("Juegos", gamesTab);
-    rootFrame->addTab("Perfiles", profilesTab);
-    rootFrame->addSeparator();
-    rootFrame->addTab("Ajustes", settingsTab);
-
-    brls::Application::pushView(rootFrame);
-
-    while (brls::Application::mainLoop())
-        ;
-
-    socketExit();
-    nsExit();
-    return EXIT_SUCCESS;
+    free(rgb);
+    return rgba;
 }
+
+bool imageSize(const std::string& path, int& w, int& h)
+{
+    int c = 0;
+    return stbi_info(path.c_str(), &w, &h, &c) != 0;
+}
+
+std::vector<unsigned char> readFileBytes(const std::string& path)
+{
+    std::vector<unsigned char> out;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return out;
+    unsigned char buf[16 * 1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        out.insert(out.end(), buf, buf + n);
+    fclose(f);
+    return out;
+}
+
+// Lo que el HOME muestra hoy: el nuestro si hay, si no el del juego (de la
+// caché, que no lee la tarjeta ni el USB y es rápido).
+std::vector<unsigned char> currentIconJpeg(const std::string& tid)
+{
+    if (existe(iconPathFor(tid)))
+    {
+        auto propio = readFileBytes(iconPathFor(tid));
+        if (!propio.empty())
+            return propio;
+    }
+    return originalIconJpeg(tid);
+}
+
+// El ícono que trae el juego (el que se ve en Todas las apps con un tema vertical).
+std::vector<unsigned char> originalIconJpeg(const std::string& tid)
+{
+    std::vector<unsigned char> out;
+    NsApplicationControlData* cd = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
+    if (!cd)
+        return out;
+    size_t tam = 0;
+    u64 id     = strtoull(tid.c_str(), NULL, 16);
+    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_CacheOnly, id, cd, sizeof(NsApplicationControlData), &tam)) && tam > sizeof(cd->nacp))
+        out.assign(cd->icon, cd->icon + (tam - sizeof(cd->nacp)));
+    free(cd);
+    return out;
+}
+
+EstadoIcono iconState(const std::string& tid)
+{
+    if (!hasCustomIcon(tid))
+        return EstadoIcono::Original;
+    std::error_code ec;
+    auto grande = std::filesystem::file_size(iconPathFor(tid), ec);
+    if (!ec && grande > LIMITE_GRANDE)
+        return EstadoIcono::NoEntra;
+    auto chico = std::filesystem::file_size(smallIconPathFor(tid), ec);
+    if (!ec && chico > LIMITE_CHICO)
+        return EstadoIcono::NoEntra;
+    return EstadoIcono::Propio;
+}
+
+// ------------------------------------------------- nombres (sys-ticon) ----
+// sys-ticon lee atmosphere/contents/<tid>/config.ini, sección [override_nacp]
+// al principio del archivo: name y author van siempre juntos.
+
+bool namesSysmoduleInstalled()
+{
+    return existe(SYSTWEAK_PATH);
+}
+
+static std::string nameConfigPath(const std::string& tid)
+{
+    return "sdmc:/atmosphere/contents/" + tid + "/config.ini";
+}
+
+// El archivo partido en la sección nuestra y el resto, que se conserva tal cual.
+static void splitConfig(const std::string& tid, std::map<std::string, std::string>& nuestra, std::string& resto)
+{
+    std::ifstream f(nameConfigPath(tid));
+    std::string linea;
+    bool dentro = false;
+    while (std::getline(f, linea))
+    {
+        std::string l = linea;
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        if (!l.empty() && l[0] == '[')
+            dentro = l == "[override_nacp]";
+        if (dentro)
+        {
+            size_t eq = l.find('=');
+            if (eq != std::string::npos)
+                nuestra[l.substr(0, eq)] = l.substr(eq + 1);
+        }
+        else
+            resto += linea + "\n";
+    }
+}
+
+std::string customName(const std::string& tid)
+{
+    std::map<std::string, std::string> nuestra;
+    std::string resto;
+    splitConfig(tid, nuestra, resto);
+    return nuestra.count("name") ? nuestra["name"] : "";
+}
+
+bool setCustomName(const std::string& tid, const std::string& nombre, const std::string& autor)
+{
+    if (nombre.empty() || nombre.size() > 511 || autor.size() > 255)
+        return false;
+    std::map<std::string, std::string> nuestra;
+    std::string resto;
+    splitConfig(tid, nuestra, resto);
+    std::error_code ec;
+    std::filesystem::create_directories("sdmc:/atmosphere/contents/" + tid, ec);
+    std::ofstream o(nameConfigPath(tid), std::ios::trunc | std::ios::binary);
+    if (!o)
+        return false;
+    // Nuestra sección primero: así lo pide sys-ticon. UTF-8 sin BOM.
+    o << "[override_nacp]\nname=" << nombre << "\nauthor=" << (autor.empty() ? " " : autor) << "\n";
+    if (nuestra.count("display_version"))
+        o << "display_version=" << nuestra["display_version"] << "\n";
+    o << resto;
+    return o.good();
+}
+
+bool removeCustomName(const std::string& tid)
+{
+    std::map<std::string, std::string> nuestra;
+    std::string resto;
+    splitConfig(tid, nuestra, resto);
+    if (!nuestra.count("name"))
+        return false;
+    bool vacio = resto.find_first_not_of(" \r\n\t") == std::string::npos;
+    if (vacio && !nuestra.count("display_version"))
+        return std::remove(nameConfigPath(tid).c_str()) == 0;
+    std::ofstream o(nameConfigPath(tid), std::ios::trunc | std::ios::binary);
+    if (nuestra.count("display_version"))
+        o << "[override_nacp]\ndisplay_version=" << nuestra["display_version"] << "\n";
+    o << resto;
+    return o.good();
+}
+
+std::vector<unsigned char> loadRGB(const std::string& path, int& w, int& h)
+{
+    std::vector<unsigned char> out;
+    int c = 0;
+    unsigned char* img = stbi_load(path.c_str(), &w, &h, &c, 3);
+    if (img == NULL)
+        return out;
+    out.assign(img, img + (size_t)w * h * 3);
+    stbi_image_free(img);
+    return out;
+}
+
+std::vector<unsigned char> renderRGBA(const unsigned char* rgb, int w, int h, int fitMode, int side)
+{
+    std::vector<unsigned char> rgba;
+    unsigned char* px = renderPixels(const_cast<unsigned char*>(rgb), w, h, fitMode, side);
+    if (px == NULL)
+        return rgba;
+    rgba.resize((size_t)side * side * 4);
+    for (size_t i = 0; i < (size_t)side * side; i++)
+    {
+        rgba[i * 4 + 0] = px[i * 3 + 0];
+        rgba[i * 4 + 1] = px[i * 3 + 1];
+        rgba[i * 4 + 2] = px[i * 3 + 2];
+        rgba[i * 4 + 3] = 255;
+    }
+    free(px);
+    return rgba;
+}
+
+bool writePngRGB(const std::string& path, int w, int h, const unsigned char* rgb)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    return stbi_write_png(path.c_str(), w, h, 3, rgb, w * 3) != 0;
+}
+

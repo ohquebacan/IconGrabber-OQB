@@ -45,7 +45,7 @@ ICON		:=	resources/icon/oqb.jpg
 INCLUDES	:=	example
 APP_TITLE	:=	IconGrabber OQB
 APP_AUTHOR	:=	OH! QUÉ BACÁN
-APP_VERSION	:=	2.1.2
+APP_VERSION	:=	3.0.0
 
 ROMFS				:=	resources
 BOREALIS_PATH		:=	.
@@ -60,7 +60,7 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES) `curl-config --cflags`
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__ \
-			-DBOREALIS_RESOURCES="\"$(BOREALIS_RESOURCES)\""
+			-DBOREALIS_RESOURCES="\"$(BOREALIS_RESOURCES)\"" -DAPP_VERSION="\"$(APP_VERSION)\""
 
 CXXFLAGS	:= $(CFLAGS) -std=gnu++17 -fexceptions -Wno-reorder
 
