@@ -194,6 +194,7 @@ class VistaLote : public brls::View
         std::atomic<bool> cancelar{ false };
         std::atomic<int> fase{ 0 };  // 0 buscando, 1 propuesto, 2 aplicando, 3 terminado
         std::atomic<int> hechos{ 0 }, total{ 0 }, puestos{ 0 }, fallados{ 0 };
+        std::atomic<int> sinVer{ 0 };  // los que no se ven hasta reiniciar (sys-icon)
         std::vector<Propuesta> props;
     };
 

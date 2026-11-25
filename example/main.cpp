@@ -223,7 +223,6 @@ std::string toLower(std::string s)
 //   1 ajustar:  entra completa, con franjas del color del borde a los lados.
 //   2 estirar:  la aplasta hasta el cuadrado (lo que hacía antes).
 //   3 tema vertical: la prepara para temas que estiran el ícono a 2:3.
-void invalidateControlCache(const std::string& tid);
 bool controlDataAvailable(u64 appId);
 
 // El cuadro final (SIDE x SIDE, RGB) según el modo, sin escribir nada. Lo usan
@@ -487,7 +486,9 @@ static bool overwriteIconImpl(const std::string& tid, const std::string& imagePa
     // original, reiniciar, y recien entonces elegir otro. Invalidando aqui el
     // sistema refresca primero al original y despues al nuevo, que es lo mismo
     // que hacia ese rodeo manual pero sin reiniciar.
-    invalidateControlCache(tid);
+    // Sin recargar el HOME todavía: con sys-icon, si lo consulta ahora que no hay
+    // archivos, se queda con que el juego no tiene ícono propio hasta reiniciar.
+    invalidateControlCache(tid, false);
 
     // Los dos archivos se muestran distinto, así que se preparan distinto:
     //  - el grande lo estira el tema vertical, así que va aplastado a propósito;
@@ -925,7 +926,130 @@ bool controlDataAvailable(u64 appId)
     return ok;
 }
 
-void invalidateControlCache(const std::string& tid)
+/* En 23.5 el comando 404 solo ya no basta: borra la caché, pero el HOME no
+   vuelve a pedir el ícono hasta reiniciar. Lo que sí lo hace recargar el juego
+   en el momento es que ns publique otra vez su registro, como cuando se instala
+   algo. Se vuelve a publicar idéntico (los mismos contenidos y el mismo último
+   evento), así que no cambia nada más que el aviso al HOME. Es lo mismo que hace
+   «Actualizar HOME» en Nexus Bacán (RefreshHome en home_badges.cpp, probado en
+   la Lite el 25-nov-2026). Comandos 16 y 17 de IApplicationManagerInterface. */
+namespace
+{
+struct RegistroContenido
+{
+    NcmContentMetaKey key;
+    u8 storage_id;
+    u8 padding[0x7];
+};
+static_assert(sizeof(RegistroContenido) == 0x18, "ContentStorageRecord mide 0x18");
+
+bool leerRegistro(Service* srv, u64 appId, u8& evento, std::vector<RegistroContenido>& registros)
+{
+    bool encontrado = false;
+    std::vector<NsApplicationRecord> pagina(64);
+    s32 desde = 0, leidos = 0;
+    do
+    {
+        if (R_FAILED(nsListApplicationRecord(pagina.data(), (s32)pagina.size(), desde, &leidos))) return false;
+        for (s32 i = 0; i < leidos; ++i)
+            if (pagina[i].application_id == appId)
+            {
+                evento     = pagina[i].last_event;
+                encontrado = true;
+                break;
+            }
+        desde += leidos;
+    } while (!encontrado && leidos == (s32)pagina.size() && desde < 16384);
+    if (!encontrado) return false;
+
+    s32 cuantos = 0;
+    if (R_FAILED(nsCountApplicationContentMeta(appId, &cuantos)) || cuantos <= 0 || cuantos > 4096) return false;
+    registros.resize(cuantos);
+    const struct
+    {
+        u64 offset;
+        u64 tid;
+    } in = { 0, appId };
+    s32 vinieron = 0;
+    if (R_FAILED(serviceDispatchInOut(srv, 17, in, vinieron,
+            .buffer_attrs = { SfBufferAttr_HipcMapAlias | SfBufferAttr_Out },
+            .buffers      = { { registros.data(), registros.size() * sizeof(RegistroContenido) } })))
+        return false;
+    // Si no vino exactamente lo que ns dijo que había, mejor no publicar nada:
+    // un registro con contenidos de menos dejaría el juego a medias.
+    return vinieron == cuantos;
+}
+
+bool republicarRegistro(Service* srv, u64 appId)
+{
+    // Con IconGrabber abierto en lugar de un juego (title override), ese juego
+    // está corriendo: a su registro no se lo toca, se queda con el 404 solo.
+    u64 propio = 0;
+    if (R_SUCCEEDED(svcGetInfo(&propio, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)) && propio == appId) return false;
+
+    u8 evento = 0;
+    std::vector<RegistroContenido> registros;
+    if (!leerRegistro(srv, appId, evento, registros)) return false;
+    const struct
+    {
+        u8 last_modified_event;
+        u8 padding[0x7];
+        u64 tid;
+    } in = { evento, { 0 }, appId };
+    return R_SUCCEEDED(serviceDispatchIn(srv, 16, in,
+        .buffer_attrs = { SfBufferAttr_HipcMapAlias | SfBufferAttr_In },
+        .buffers      = { { registros.data(), registros.size() * sizeof(RegistroContenido) } }));
+}
+
+/* sys-icon (pack sin Nexus) guarda por juego si tiene icon.jpg. Un juego que no
+   tenía ícono propio cuando el HOME lo consultó sigue sin mostrar el nuevo hasta
+   reiniciar, aunque se lo recargue. Como aproximación del arranque se toma la
+   lista de juegos con ícono propio al abrir la app; un juego que el HOME vuelve
+   a cargar sin ícono propio (porque se lo quitamos) sale de la lista. */
+std::mutex g_conIconoMutex;
+std::set<std::string> g_conIconoAlCargar;
+bool g_conIconoListo = false;
+}  // namespace
+
+std::vector<std::string> titlesWithIcons();
+std::atomic<int> g_sinVerHastaReiniciar{ 0 };
+
+void recordarIconosDelArranque()
+{
+    std::lock_guard<std::mutex> l(g_conIconoMutex);
+    if (g_conIconoListo) return;
+    for (const std::string& tid : titlesWithIcons()) g_conIconoAlCargar.insert(tid);
+    g_conIconoListo = true;
+}
+
+bool seVeSinReiniciar(const std::string& tid)
+{
+    if (nexusInstalado() || !sysIconActivo()) return true;
+    if (!hasCustomIcon(tid)) return true;
+    std::lock_guard<std::mutex> l(g_conIconoMutex);
+    return g_conIconoAlCargar.count(tid) > 0;
+}
+
+std::string avisoHome(const std::string& tid)
+{
+    if (!nexusInstalado() && !sysIconActivo())
+        return "Probablemente no se vea todavía: no encuentro sys-icon activo ni Nexus Bacán. sys-icon se instala desde OQB Updater › Apps › Sysmodules.";
+    if (!seVeSinReiniciar(tid))
+        return "Probablemente se vea recién al reiniciar: es su primer ícono propio desde que encendiste la consola.";
+    if (nexusInstalado() && juegosEnUsb().count(strtoull(tid.c_str(), NULL, 16)))
+        return "Ya se ve en el HOME. La insignia USB vuelve con «Actualizar HOME» en Nexus Bacán, con el USB conectado.";
+    return "Ya se ve en el HOME.";
+}
+
+void avisarCambio(const std::string& tid, const std::string& mensaje)
+{
+    if (seVeSinReiniciar(tid))
+        avisar(mensaje + "\n" + avisoHome(tid));
+    else
+        askReboot(mensaje + "\n\n" + avisoHome(tid));
+}
+
+void invalidateControlCache(const std::string& tid, bool refrescarHome)
 {
     u64 appId = strtoull(tid.c_str(), NULL, 16);
 
@@ -940,6 +1064,22 @@ void invalidateControlCache(const std::string& tid)
     if (R_FAILED(nsGetApplicationManagerInterface(&srv)))
         return;
     serviceDispatchIn(&srv, 404, appId);
+    if (refrescarHome)
+    {
+        const bool ok = republicarRegistro(&srv, appId);
+        // Otra vez, por si el HOME pidió los datos antes de que llegara el
+        // primero: así recarga seguro lo que hay ahora en la SD.
+        serviceDispatchIn(&srv, 404, appId);
+        marca(std::string("HOME ") + tid + (ok ? " recargado" : " sin registro, solo caché"));
+
+        if (!seVeSinReiniciar(tid))
+            g_sinVerHastaReiniciar++;
+        else if (ok && !hasCustomIcon(tid) && sysIconActivo() && !nexusInstalado())
+        {
+            std::lock_guard<std::mutex> l(g_conIconoMutex);
+            g_conIconoAlCargar.erase(tid);
+        }
+    }
     serviceClose(&srv);
 }
 
@@ -959,7 +1099,7 @@ bool extractOriginalIcon(const std::string& tid, std::string& outPath)
     // acabaríamos reaplicando lo que ya había. Se quitan antes de preguntar.
     std::remove(iconPathFor(tid).c_str());
     std::remove(smallIconPathFor(tid).c_str());
-    invalidateControlCache(tid);
+    invalidateControlCache(tid, false);
 
     NsApplicationControlData* controlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
     if (controlData == NULL)
@@ -1005,15 +1145,15 @@ bool useOriginalIconAdapted(const std::string& tid, const std::string& gameName)
         avisar("No se pudo preparar el ícono original");
         return false;
     }
-    avisar("Ícono original adaptado: " + gameName + "\nSe ve al reiniciar");
+    avisarCambio(tid, "Ícono original adaptado: " + gameName);
     return true;
 }
 
-// El cambio no se ve hasta reiniciar, así que conviene ofrecerlo en el momento
-// y no dejar que el usuario tenga que acordarse de ir a Ajustes.
+// Cuando un cambio no se ve hasta reiniciar, conviene ofrecerlo en el momento y
+// no dejar que el usuario tenga que acordarse de ir a Ajustes.
 void askReboot(const std::string& mensaje)
 {
-    brls::Dialog* dialog = new DialogoCentrado(mensaje + "\n\nLos íconos se ven después de reiniciar.\n¿Reiniciar ahora?");
+    brls::Dialog* dialog = new DialogoCentrado(mensaje + "\n\n¿Reiniciar ahora?");
     dialog->addButton("Reiniciar", [](brls::View* v) {
         if (R_SUCCEEDED(spsmInitialize()))
         {
@@ -1043,7 +1183,7 @@ bool restoreOriginalIcon(const std::string& tid, const std::string& gameName)
     std::remove(smallIconPathFor(tid).c_str());
     setIconSource(tid, "");
     invalidateControlCache(tid);
-    avisar("Ícono original restaurado: " + gameName + "\nSe ve después de reiniciar");
+    avisarCambio(tid, "Ícono original restaurado: " + gameName);
     return true;
 }
 
@@ -1091,7 +1231,7 @@ void frame_localImages(const std::string& tid, const std::string& gameName)
             brls::ListItem* litem = new brls::ListItem(filename, "", origen);
             litem->getClickEvent()->subscribe([=](brls::View* view) {
                 if (overwriteIcon(tid, path))
-                    askReboot("Ícono aplicado a " + gameName);
+                    avisarCambio(tid, "Ícono aplicado a " + gameName);
                 else
                     avisar("No se pudo leer esa imagen");
             });
@@ -1225,7 +1365,7 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
                     return;
                 }
                 if (overwriteIcon(tid, full))
-                    avisar("Ícono aplicado a " + gameName + "\nSe ve al reiniciar");
+                    avisarCambio(tid, "Ícono aplicado a " + gameName);
                 else
                     avisar("La imagen descargada no se pudo leer");
             });
@@ -1264,7 +1404,7 @@ void frame_icons(const std::string& tid, const std::string& gameName, const std:
                         return;
                     }
                     if (overwriteIcon(tid, full))
-                        askReboot("Ícono aplicado a " + gameName);
+                        avisarCambio(tid, "Ícono aplicado a " + gameName);
                     else
                         avisar("La imagen descargada no se pudo leer");
                 });
@@ -1615,8 +1755,11 @@ int applyProfile(const std::string& nombre)
     int puestos = 0;
 
     // Un perfil es un juego completo de íconos para su tema: primero se quitan
-    // los que hay (pueden ser del otro tema) y después se ponen los suyos.
-    removeAllIcons();
+    // los que hay (pueden ser del otro tema) y después se ponen los suyos. El
+    // HOME se recarga al final, con cada juego ya en su estado nuevo.
+    std::set<std::string> quitados;
+    for (const std::string& tid : titlesWithIcons()) quitados.insert(tid);
+    removeAllIcons(false);
 
     // Su tema, para que lo que pongas después salga igual.
     try
@@ -1658,22 +1801,24 @@ int applyProfile(const std::string& nombre)
         if (alguno)
         {
             invalidateControlCache(tid);
+            quitados.erase(tid);
             puestos++;
         }
     }
+    for (const std::string& tid : quitados) invalidateControlCache(tid);
     return puestos;
 }
 
 // Deja la consola con los íconos de siempre. Sólo borra los dos archivos que
 // escribimos nosotros; lo demás de cada carpeta se queda intacto.
-int removeAllIcons()
+int removeAllIcons(bool refrescarHome)
 {
     int quitados = 0;
     for (const std::string& tid : titlesWithIcons())
     {
         std::remove(iconPathFor(tid).c_str());
         std::remove(smallIconPathFor(tid).c_str());
-        invalidateControlCache(tid);
+        invalidateControlCache(tid, refrescarHome);
         quitados++;
     }
     return quitados;
@@ -1746,7 +1891,7 @@ void frame_profile(const std::string& nombre)
             if (std::filesystem::exists(small, ec2))
                 copyFileRaw(small, dest + "icon174.jpg");
             invalidateControlCache(tid);
-            avisar("Aplicado a " + etiqueta + "\nSe ve al reiniciar");
+            avisarCambio(tid, "Aplicado a " + etiqueta);
         };
 
         item->getClickEvent()->subscribe([aplicarUno](brls::View* view) { aplicarUno(); });

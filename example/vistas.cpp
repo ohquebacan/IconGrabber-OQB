@@ -878,7 +878,7 @@ void VistaIconos::aplicar(bool recorte)
             if (!controlDataAvailable(strtoull(tid.c_str(), NULL, 16)))
                 ap->mensaje += "\nEl juego no está instalado: se verá al reinstalarlo.";
             else
-                ap->mensaje += "\nSi el HOME sigue mostrando el anterior, reinicia.";
+                ap->mensaje += "\n" + avisoHome(tid);
         }
         else
             ap->mensaje = "No se pudo poner: probablemente la imagen no entra en el HOME ni con menos calidad. Prueba otra.";
@@ -965,6 +965,8 @@ void VistaIconos::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned he
         this->aplicando.reset();
         if (ap->recorte && ap->ok)
             brls::Application::pushView(new MarcoCompleto(new VistaRecorte(this->tid, this->nombre, ap->imagen)));
+        else if (ap->ok && !seVeSinReiniciar(this->tid))
+            askReboot(ap->mensaje);
         else
             avisar(ap->mensaje);
         if (this->actual > 0) nvgDeleteImage(vg, this->actual);
@@ -1294,7 +1296,7 @@ void VistaRecorte::aplicar()
         {
             std::error_code ec;
             auto g = std::filesystem::file_size(iconPathFor(tid), ec);
-            ap->mensaje = "Listo: grande " + kb(g) + ". Entra en el HOME.\nSi el HOME sigue mostrando el anterior, reinicia.";
+            ap->mensaje = "Listo: grande " + kb(g) + ". Entra en el HOME.\n" + avisoHome(tid);
         }
         else
             ap->mensaje = "No se pudo poner: probablemente no entra en el HOME ni con menos calidad. Prueba acercando o con otra imagen.";
@@ -1309,7 +1311,10 @@ void VistaRecorte::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned h
     {
         auto ap = this->aplicando;
         this->aplicando.reset();
-        avisar(ap->mensaje);
+        if (ap->ok && !seVeSinReiniciar(this->tid))
+            askReboot(ap->mensaje);
+        else
+            avisar(ap->mensaje);
         if (ap->ok)
         {
             brls::Application::popView();
@@ -1731,6 +1736,7 @@ void VistaLote::aplicar()
     s->total = cuantos;
     lanzar([s] {
         g_silencio = true;
+        const int antes = g_sinVerHastaReiniciar.load();
         for (size_t i = 0;; ++i)
         {
             Propuesta p;
@@ -1745,6 +1751,7 @@ void VistaLote::aplicar()
             else s->fallados++;
             s->hechos++;
         }
+        s->sinVer = g_sinVerHastaReiniciar.load() - antes;
         g_genIconos++;
         s->fase = 3;
     });
@@ -1824,7 +1831,14 @@ void VistaLote::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned heig
         if (!this->avisado)
         {
             this->avisado = true;
-            askReboot("Íconos puestos en " + std::to_string(s->puestos) + " juegos");
+            const std::string m = "Íconos puestos en " + std::to_string(s->puestos) + " juegos.";
+            if (s->sinVer > 0)
+                askReboot(m + "\n\nProbablemente " + (s->sinVer == 1 ? std::string("uno se vea") : std::to_string(s->sinVer) + " se vean") +
+                          " recién al reiniciar: es su primer ícono propio desde que encendiste la consola.");
+            else if (s->puestos > 0 && !nexusInstalado() && !sysIconActivo())
+                avisar(m + "\nProbablemente no se vean todavía: no encuentro sys-icon activo ni Nexus Bacán.");
+            else if (s->puestos > 0)
+                avisar(m + "\nYa se ven en el HOME." + (nexusInstalado() && !juegosEnUsb().empty() ? "\nLa insignia USB vuelve con «Actualizar HOME» en Nexus Bacán, con el USB conectado." : ""));
         }
     }
     barra(this, vg, lx, by, lw, avance);
@@ -2084,6 +2098,7 @@ class VistaTrabajo : public brls::View
     {
         std::atomic<int> hecho{ 0 }, total{ 0 };
         std::atomic<bool> termino{ false };
+        std::atomic<int> sinVer{ 0 };  // íconos que no se ven hasta reiniciar (sys-icon)
         std::mutex m;
         std::string resultado;
     };
@@ -2096,10 +2111,12 @@ class VistaTrabajo : public brls::View
         auto s = this->st;
         lanzar([s, trabajo] {
             g_silencio = true;
+            const int antes = g_sinVerHastaReiniciar.load();
             std::string r = trabajo([s](int h, int t) {
                 s->hecho = h;
                 s->total = t;
             });
+            s->sinVer = g_sinVerHastaReiniciar.load() - antes;
             g_genIconos++;
             std::lock_guard<std::mutex> l(s->m);
             s->resultado = r;
@@ -2113,16 +2130,17 @@ class VistaTrabajo : public brls::View
             if (this->st->termino) brls::Application::popView();
             return true;
         }, true);
+        // Oculto: solo se ofrece en el texto, cuando hace falta de verdad.
         if (reinicio)
             this->registerAction("Reiniciar ahora", brls::Key::Y, [this] {
-                if (!this->st->termino) return true;
+                if (!this->st->termino || this->st->sinVer <= 0) return true;
                 if (R_SUCCEEDED(spsmInitialize()))
                 {
                     spsmShutdown(true);
                     spsmExit();
                 }
                 return true;
-            });
+            }, true);
     }
     brls::View* getDefaultFocus() override { return this; }
     void layout(NVGcontext*, brls::Style*, brls::FontStash*) override {}
@@ -2136,7 +2154,16 @@ class VistaTrabajo : public brls::View
         if (this->st->termino)
         {
             std::lock_guard<std::mutex> l(this->st->m);
-            t      = this->st->resultado + (this->reinicio ? "\n\nLos íconos del HOME se refrescan del todo al reiniciar ()." : "");
+            const int n = this->st->sinVer.load();
+            t = this->st->resultado;
+            if (this->reinicio && n > 0)
+                t += "\n\nProbablemente " + (n == 1 ? std::string("uno se vea") : std::to_string(n) + " se vean") +
+                     " recién al reiniciar: es su primer ícono propio desde que encendiste la consola. Reiniciar ahora ().";
+            else if (this->reinicio && this->sinSysmodule)
+                t += "\n\nProbablemente no se vean todavía: no encuentro sys-icon activo ni Nexus Bacán.";
+            else if (this->reinicio)
+                t += std::string("\n\nYa se ven en el HOME.") +
+                     (this->usb ? " La insignia USB vuelve con «Actualizar HOME» en Nexus Bacán, con el USB conectado." : "");
             avance = 1;
         }
         else if (this->st->total > 0)
@@ -2161,6 +2188,8 @@ class VistaTrabajo : public brls::View
   private:
     std::string tit, det;
     bool reinicio;
+    bool usb = nexusInstalado() && !juegosEnUsb().empty();
+    bool sinSysmodule = !nexusInstalado() && !sysIconActivo();
     std::shared_ptr<Estado> st;
 };
 }  // namespace

@@ -39,8 +39,21 @@ bool restoreOriginalIcon(const std::string& tid, const std::string& gameName);
 bool useOriginalIconAdapted(const std::string& tid, const std::string& gameName);
 bool extractOriginalIcon(const std::string& tid, std::string& outPath);
 bool controlDataAvailable(u64 appId);
-void invalidateControlCache(const std::string& tid);
+// refrescarHome: además de la caché, vuelve a publicar el registro del juego para
+// que el HOME lo recargue ya (false solo para estados intermedios).
+void invalidateControlCache(const std::string& tid, bool refrescarHome = true);
 void askReboot(const std::string& mensaje);
+// Lista de juegos con ícono propio al abrir la app (para lo de sys-icon).
+void recordarIconosDelArranque();
+// Con sys-icon, el primer ícono propio de un juego no se ve hasta reiniciar.
+bool seVeSinReiniciar(const std::string& tid);
+// Una línea para después de cambiar un ícono: si ya se ve, si hay que reiniciar
+// o si falta la insignia USB de Nexus.
+std::string avisoHome(const std::string& tid);
+// Aviso con avisoHome, u ofrece reiniciar si hace falta.
+void avisarCambio(const std::string& tid, const std::string& mensaje);
+// Cuántas veces quedó un ícono sin verse hasta reiniciar (para los trabajos largos).
+extern std::atomic<int> g_sinVerHastaReiniciar;
 
 nlohmann::json& installedGames(bool refresh = false);
 std::set<u64> juegosEnUsb();
@@ -58,7 +71,7 @@ void frame_localImages(const std::string& tid, const std::string& gameName);
 void fillProfilesTab(brls::List* list);
 int applyProfile(const std::string& nombre);
 int saveProfile(const std::string& nombre);
-int removeAllIcons();
+int removeAllIcons(bool refrescarHome = true);
 
 // Rediseño
 std::vector<unsigned char> previewRGBA(const std::string& imagePath, int fitMode, int side);

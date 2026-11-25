@@ -31,6 +31,7 @@ int main(int argc, char* argv[])
         abort();
     });
     nsInitialize();
+    recordarIconosDelArranque();
     socketInitializeDefault();
     curl_global_init(CURL_GLOBAL_ALL);
 
