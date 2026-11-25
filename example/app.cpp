@@ -86,7 +86,7 @@ int main(int argc, char* argv[])
     // sys-icon y Nexus Bacán juntos: al encender, la consola se queda en el logo.
     if (sysIconActivo() && nexusInstalado())
     {
-        brls::Dialog* d = new DialogoCentrado("Tienes sys-icon y Nexus Bacán a la vez. Con los dos, la consola se queda en el logo de Nintendo Switch al reiniciar.\n\nApaga sys-icon antes de reiniciar. Tus íconos quedan guardados para cuando lo vuelvas a usar.");
+        brls::Dialog* d = new DialogoCentrado("Tienes sys-icon y Nexus Bacán a la vez. Con los dos, la consola se queda en el logo de Nintendo Switch al reiniciar.\n\nApaga sys-icon antes de reiniciar. Con Nexus Bacán no hace falta: él sigue mostrando tus íconos y tus nombres.");
         d->addButton("Apagar sys-icon", [d](brls::View*) {
             const bool ok = apagarSysIcon();
             d->close([ok] { avisar(ok ? "sys-icon apagado. Ya puedes reiniciar." : "No se pudo apagar: borra atmosphere/contents/00FF69636F6EFF00/flags/boot2.flag"); });

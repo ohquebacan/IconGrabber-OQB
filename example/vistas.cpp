@@ -371,10 +371,12 @@ MarcoPrincipal::MarcoPrincipal()
     this->setTitle("");
     // Corto: a la derecha van los botones.
     std::string pie = "v" APP_VERSION;
-    if (sysmoduleInstalled())
+    if (nexusInstalado())
+        pie += " · los íconos los pone Nexus Bacán";
+    else if (sysmoduleInstalled())
         pie += " · " + sysmoduleName();
     else
-        pie += nexusInstalado() ? " · sin sys-icon (no va con Nexus)" : " · sin sys-icon";
+        pie += " · sin sys-icon";
     this->setFooterText(pie);
 }
 
@@ -2204,10 +2206,10 @@ void enSegundoPlano(const std::string& titulo, const std::string& detalle, Traba
 brls::View* crearNombres()
 {
     brls::List* list = new brls::List();
-    if (!namesSysmoduleInstalled())
-        list->addView(new brls::ListItem("Falta sys-icon", nexusInstalado()
-            ? "Para cambiar nombres hace falta sys-icon, pero no funciona junto con Nexus Bacán (la consola se queda en el logo). Los nombres que pongas aquí quedan guardados."
-            : "Para cambiar nombres hace falta sys-icon. Lo instalas desde OQB Updater › Apps › Sysmodules. Los nombres que pongas aquí quedan guardados y se usan cuando lo tengas."));
+    // Con Nexus Bacán los nombres también se aplican (lee el mismo config.ini).
+    if (!namesSysmoduleInstalled() && !nexusInstalado())
+        list->addView(new brls::ListItem("Falta sys-icon",
+            "Para cambiar nombres hace falta sys-icon o Nexus Bacán. sys-icon lo instalas desde OQB Updater › Apps › Sysmodules. Los nombres que pongas aquí quedan guardados y se usan cuando lo tengas."));
     list->addView(new brls::Header("A cambia el nombre · X vuelve al original · se ve al reiniciar"));
     for (auto& g : installedGames())
     {
